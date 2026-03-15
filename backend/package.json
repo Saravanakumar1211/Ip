@@ -10,9 +10,11 @@
     "import-data": "node src/services/importData.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.12.1",
     "xlsx": "^0.18.5"
   },
