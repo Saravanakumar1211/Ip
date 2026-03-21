@@ -1314,6 +1314,17 @@ function App() {
                             </div>
                           </div>
 
+                          {directionsUrl && (
+                            <a
+                              className="location-link"
+                              href={directionsUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              View route on Google Maps
+                            </a>
+                          )}
+
                           <div className="plan-grid">
                             <div>
                               <strong>Purchase</strong>

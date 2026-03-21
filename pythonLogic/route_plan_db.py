@@ -20,6 +20,7 @@ if not MONGO_URI:
 
 CAPACITY_BY_TYPE = {ft["type"]: ft for ft in lg.FLEET}
 USE_GOOGLE = bool(GOOGLE_API_KEY)
+FAST_ROUTE = os.getenv("FAST_ROUTE", "1") != "0"
 
 
 def _coord_string(lat, lon):
@@ -29,6 +30,11 @@ def _coord_string(lat, lon):
 def road_info(olat, olon, dlat, dlon):
     if USE_GOOGLE:
         return lg.get_road_info(olat, olon, dlat, dlon)
+    dist = lg.haversine(olat, olon, dlat, dlon) * 1.3
+    return dist, 0.0
+
+
+def approx_road_info(olat, olon, dlat, dlon):
     dist = lg.haversine(olat, olon, dlat, dlon) * 1.3
     return dist, 0.0
 
@@ -152,9 +158,14 @@ def build_plan(stations, sources, trucks):
         best_dist = best_toll = best_tc = best_pc = None
 
         for _, src in sources.iterrows():
-            dist_km, toll = road_info(
-                float(src["lat"]), float(src["lon"]), slat, slon
-            )
+            if FAST_ROUTE:
+                dist_km, toll = approx_road_info(
+                    float(src["lat"]), float(src["lon"]), slat, slon
+                )
+            else:
+                dist_km, toll = road_info(
+                    float(src["lat"]), float(src["lon"]), slat, slon
+                )
             tc = lg.calc_transport_cost(dist_km, needed_mt)
             pc = float(src["Price / MT Ex Terminal"]) * needed_mt
             tot = pc + tc + toll
@@ -162,6 +173,18 @@ def build_plan(stations, sources, trucks):
                 best_total = tot
                 best_src = src.copy()
                 best_dist, best_toll, best_tc, best_pc = dist_km, toll, tc, pc
+
+        if best_src is None:
+            continue
+
+        if FAST_ROUTE:
+            dist_km, toll = road_info(
+                float(best_src["lat"]), float(best_src["lon"]), slat, slon
+            )
+            tc = lg.calc_transport_cost(dist_km, needed_mt)
+            pc = float(best_src["Price / MT Ex Terminal"]) * needed_mt
+            best_dist, best_toll, best_tc, best_pc = dist_km, toll, tc, pc
+            best_total = pc + tc + toll
         station_data.append(
             {
                 "station": sname,
