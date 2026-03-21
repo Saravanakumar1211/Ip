@@ -1,0 +1,182 @@
+{
+  "T01": {
+    "station": "Ariyalur - Trichy Main Road,",
+    "lat": 11.12081372869989,
+    "lon": 79.07187652071202,
+    "type": "12MT"
+  },
+  "T02": {
+    "station": "Viruthunagar - Sivakasi Road",
+    "lat": 9.584021018675898,
+    "lon": 77.94401836470445,
+    "type": "12MT"
+  },
+  "T03": {
+    "station": "Chennai - Vadivelan Nagar",
+    "lat": 12.974891927245105,
+    "lon": 80.2159390838379,
+    "type": "12MT"
+  },
+  "T04": {
+    "station": "Coimbatore - Saravanampatti ,",
+    "lat": 11.094276755834239,
+    "lon": 77.01395148006975,
+    "type": "12MT"
+  },
+  "T05": {
+    "station": "Pudukkottai - Nathampannai",
+    "lat": 10.383447611963357,
+    "lon": 78.8015733242383,
+    "type": "12MT"
+  },
+  "T06": {
+    "station": "Krishnagiri - Hosur",
+    "lat": 12.72906852553019,
+    "lon": 77.84112812427622,
+    "type": "12MT"
+  },
+  "T07": {
+    "station": "Dindigul - Palani Road",
+    "lat": 10.377950289550679,
+    "lon": 77.9437059647156,
+    "type": "12MT"
+  },
+  "T08": {
+    "station": "Salem - Uthamasolapuram",
+    "lat": 11.622645056329256,
+    "lon": 78.07708738566681,
+    "type": "12MT"
+  },
+  "T09": {
+    "station": "Pudukkottai - Nathampannai",
+    "lat": 10.383447611963357,
+    "lon": 78.8015733242383,
+    "type": "12MT"
+  },
+  "T10": {
+    "station": "Tirunelveli - Thachanallur Road",
+    "lat": 8.742072508862366,
+    "lon": 77.71588408188796,
+    "type": "12MT"
+  },
+  "T11": {
+    "station": "Pudukkottai - Nathampannai",
+    "lat": 10.383447611963357,
+    "lon": 78.8015733242383,
+    "type": "12MT"
+  },
+  "T12": {
+    "station": "Coimbatore - Mettupalayam ,",
+    "lat": 11.316660234283928,
+    "lon": 76.92450465123743,
+    "type": "12MT"
+  },
+  "T13": {
+    "station": "Theni - Uthamapalayam",
+    "lat": 9.798213451197276,
+    "lon": 77.31976489702821,
+    "type": "12MT"
+  },
+  "T14": {
+    "station": "Tiruchirappalli - Musuri",
+    "lat": 10.973819879761264,
+    "lon": 78.43004629795097,
+    "type": "12MT"
+  },
+  "T15": {
+    "station": "Krishnagiri - Poochampalli",
+    "lat": 12.377508605855208,
+    "lon": 78.3958566836953,
+    "type": "12MT"
+  },
+  "T16": {
+    "station": "Erode - Perundurai",
+    "lat": 11.274072374174683,
+    "lon": 77.56225908797354,
+    "type": "12MT"
+  },
+  "T17": {
+    "station": "Kallakurichi - Chinnasalem",
+    "lat": 11.634065141277343,
+    "lon": 78.86102962240659,
+    "type": "12MT"
+  },
+  "T18": {
+    "station": "Chennai - Kattupakkam,",
+    "lat": 13.040677556000063,
+    "lon": 80.12984178010258,
+    "type": "12MT"
+  },
+  "T19": {
+    "station": "Madurai - Melur",
+    "lat": 10.065735072868533,
+    "lon": 78.35175656019537,
+    "type": "12MT"
+  },
+  "T20": {
+    "station": "Tiruppur - Mulanur",
+    "lat": 10.787271767174206,
+    "lon": 77.69370939849253,
+    "type": "12MT"
+  },
+  "T21": {
+    "station": "Cuddalore - Virudhachalam",
+    "lat": 11.500243390373473,
+    "lon": 79.32174696658375,
+    "type": "12MT"
+  },
+  "T22": {
+    "station": "Namakkal - Paramathyvelur",
+    "lat": 11.116473822550338,
+    "lon": 78.0167895455484,
+    "type": "12MT"
+  },
+  "T23": {
+    "station": "Thanjavur - New Bus Stand",
+    "lat": 10.738929949134354,
+    "lon": 79.10728256657181,
+    "type": "12MT"
+  },
+  "T24": {
+    "station": "Coimbatore - Mettupalayam ,",
+    "lat": 11.316660234283928,
+    "lon": 76.92450465123743,
+    "type": "7MT"
+  },
+  "T25": {
+    "station": "Dindigul - Palayam",
+    "lat": 10.736846399539056,
+    "lon": 78.13258628631992,
+    "type": "7MT"
+  },
+  "T26": {
+    "station": "Tenkasi - Madurai Courtallam Road",
+    "lat": 9.004845643036273,
+    "lon": 77.2947948402803,
+    "type": "7MT"
+  },
+  "T27": {
+    "station": "Thanjavur - Kumbakonam",
+    "lat": 10.974472772365802,
+    "lon": 79.39885455123209,
+    "type": "7MT"
+  },
+  "T28": {
+    "station": "Erode - Ammapettai",
+    "lat": 11.620948484757,
+    "lon": 77.73985483960078,
+    "type": "7MT"
+  },
+  "T29": {
+    "station": "Theni - Periyakulam Road",
+    "lat": 10.068077823047773,
+    "lon": 77.50584582596507,
+    "type": "7MT"
+  },
+  "T30": {
+    "station": "Tiruchirappalli - Ariyamangalam",
+    "lat": 10.812941148062176,
+    "lon": 78.71460972424467,
+    "type": "7MT"
+  }
+}

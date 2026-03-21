@@ -9,7 +9,8 @@ const stationSchema = new mongoose.Schema(
     },
     capacity_in_lt: { type: Number, required: true },
     dead_stock_in_lt: { type: Number, required: true },
-    usable_lt: { type: Number, required: true }
+    usable_lt: { type: Number, required: true },
+    sufficient_fuel: { type: String, required: true, enum: ["YES", "NO"] }
   },
   {
     timestamps: true

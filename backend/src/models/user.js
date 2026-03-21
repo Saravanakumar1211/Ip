@@ -10,7 +10,8 @@ const userSchema = new mongoose.Schema(
       required: true,
       enum: ["admin", "station_manager"]
     },
-    password_hash: { type: String, required: true }
+    password_hash: { type: String, required: true },
+    station: { type: String, trim: true }
   },
   {
     timestamps: true

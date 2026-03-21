@@ -7,7 +7,9 @@ import { connectDB } from "./db.js";
 import dataRoutes from "./routes/dataRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
+import managerRoutes from "./routes/managerRoutes.js";
 import { ensureAdminUser } from "./services/ensureAdminUser.js";
+import { seedStationManagers } from "./services/seedStationManagers.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
 
@@ -23,12 +25,14 @@ app.get("/health", (_req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/manager", managerRoutes);
 app.use("/api", dataRoutes);
 
 connectDB()
   .then(() => {
     return ensureAdminUser();
   })
+  .then(() => seedStationManagers())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Backend server running at http://localhost:${PORT}`);

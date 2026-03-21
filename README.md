@@ -3,8 +3,8 @@
 This project provides a basic full-stack setup for fuel operations optimization:
 - `backend`: Node.js + Express + MongoDB (Mongoose)
 - `frontend`: React (Vite)
-- `database`: MongoDB collections `user`, `source`, and `station`
-- `data source`: Excel files in `data/`
+- `database`: MongoDB collections `user`, `source`, `station`, and `truck`
+- `data source`: Excel files in `pythonLogic/` (preferred) or `data/` (fallback)
 
 ## Collections and Schema
 
@@ -16,21 +16,30 @@ This project provides a basic full-stack setup for fuel operations optimization:
 - `password_hash` (String, bcrypt)
 
 ### `source` collection
-Derived from `data/sources.xlsx`:
+Derived from `pythonLogic/sources.xlsx` (or `data/sources.xlsx` fallback):
 - `source_id` (String, unique)
 - `source_name` (String)
 - `coordinates.lat` (Number)
 - `coordinates.lng` (Number)
-- `price_in_lt` (Number)
+- `price_per_mt_ex_terminal` (Number)
 
 ### `station` collection
-Derived from `data/clean_stationss.xlsx`:
+Derived from `pythonLogic/clean_stationss.xlsx` (or `data/clean_stationss.xlsx` fallback):
 - `station` (String, unique)
 - `coordinates.lat` (Number)
 - `coordinates.lng` (Number)
 - `capacity_in_lt` (Number)
 - `dead_stock_in_lt` (Number)
 - `usable_lt` (Number)
+- `sufficient_fuel` (String: `YES` or `NO`)
+
+### `truck` collection
+Derived from `pythonLogic/truck_positions.json`:
+- `truck_id` (String, unique)
+- `station` (String)
+- `lat` (Number)
+- `lon` (Number)
+- `type` (String)
 
 ## Prerequisites
 
@@ -79,8 +88,31 @@ npm run import-data
 ```
 
 This reads:
-- `data/sources.xlsx`
-- `data/clean_stationss.xlsx`
+- `pythonLogic/sources.xlsx` (fallback: `data/sources.xlsx`)
+- `pythonLogic/clean_stationss.xlsx` (fallback: `data/clean_stationss.xlsx`)
+- `pythonLogic/truck_positions.json`
+
+## Route Planning (Python)
+
+Install Python requirements:
+
+```bash
+pip install -r pythonLogic/requirements.txt
+```
+
+Optional environment variable for the python executable:
+
+```env
+PYTHON_PATH=python
+```
+
+The admin dashboard triggers the planner via `POST /api/route-plan`, which
+writes suggested outputs into MongoDB collections:
+- `delivery`
+- `truckPlanning`
+- `tentativeCost`
+
+Planner script: `pythonLogic/route_plan_db.py`.
 
 and upserts records into `source` and `station`.
 
@@ -99,7 +131,10 @@ API endpoints:
 - `POST /api/users/station-managers` (admin JWT required)
 - `GET /api/sources` (admin JWT required)
 - `GET /api/stations` (admin JWT required)
+- `GET /api/trucks` (admin JWT required)
 - `POST /api/import` (admin JWT required)
+- `POST /api/route-plan` (admin JWT required)
+- `GET /api/route-plan/latest` (admin JWT required)
 
 ## Run Frontend
 
@@ -140,9 +175,13 @@ POST /api/users/station-managers
 {
   "name": "Station Manager",
   "username": "manager@krfuels.com",
-  "password": "Manager@123"
+  "password": "Manager@123",
+  "station": "Anna Nagar"
 }
 ```
+
+Station manager demo accounts are auto-seeded for each station (with plaintext
+passwords stored in the `user` collection for easy viewing in MongoDB).
 
 ## Notes
 

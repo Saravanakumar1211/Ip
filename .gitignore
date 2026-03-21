@@ -12,6 +12,10 @@ frontend/dist/
 .env
 .env.*
 !.env.example
+.venv/
+venv/
+env/
+.python-version
 
 # logs
 npm-debug.log*
@@ -24,3 +28,11 @@ pnpm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/

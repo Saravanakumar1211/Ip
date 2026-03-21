@@ -8,7 +8,7 @@ const sourceSchema = new mongoose.Schema(
       lat: { type: Number, required: true },
       lng: { type: Number, required: true }
     },
-    price_in_lt: { type: Number, required: true }
+    price_per_mt_ex_terminal: { type: Number, required: true }
   },
   {
     timestamps: true

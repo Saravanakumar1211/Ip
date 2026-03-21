@@ -158,7 +158,7 @@ button.danger {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   margin-bottom: 18px;
 }
@@ -195,6 +195,61 @@ button.danger {
   padding: 16px;
   overflow: auto;
   box-shadow: var(--shadow);
+}
+
+.map-frame {
+  margin: 12px 0 16px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--green-100);
+  border: 1px solid var(--green-200);
+}
+
+.map-frame img {
+  width: 100%;
+  display: block;
+}
+
+.menu-list {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.menu-item {
+  background: var(--surface);
+  color: var(--green-900);
+  border: 1px solid var(--green-200);
+  border-radius: 16px;
+  padding: 16px 18px;
+  text-align: left;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 6px;
+}
+
+.menu-item h3 {
+  margin: 0;
+  color: var(--green-900);
+}
+
+.menu-item p {
+  margin: 0;
+  color: #42664d;
+  font-size: 14px;
+}
+
+.map-frame {
+  margin: 12px 0 16px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--green-100);
+  border: 1px solid var(--green-200);
+}
+
+.map-frame img {
+  width: 100%;
+  display: block;
 }
 
 .table-wrap h2 {
@@ -321,6 +376,64 @@ button.danger {
 
 .form-modal {
   width: min(760px, 100%);
+}
+
+.plan-modal {
+  width: min(1100px, 96vw);
+  max-height: 90vh;
+  overflow: auto;
+}
+
+.plan-body {
+  display: grid;
+  gap: 20px;
+}
+
+.plan-section {
+  background: var(--green-100);
+  border-radius: 18px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.plan-section h4 {
+  margin: 0;
+  color: var(--green-900);
+}
+
+.plan-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 12px;
+}
+
+.plan-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.plan-card-header h5 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  color: var(--green-900);
+}
+
+.plan-card-header p {
+  margin: 0;
+  color: #42664d;
+  font-size: 13px;
+}
+
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
 }
 
 .modal-header {

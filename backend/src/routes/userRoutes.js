@@ -1,6 +1,4 @@
 import { Router } from "express";
-import bcrypt from "bcryptjs";
-
 import { User } from "../models/user.js";
 import { authenticate, requireRole } from "../middleware/auth.js";
 
@@ -10,12 +8,12 @@ router.use(authenticate);
 router.use(requireRole(["admin"]));
 
 router.post("/station-managers", async (req, res) => {
-  const { name, username, password } = req.body || {};
+  const { name, username, password, station } = req.body || {};
 
-  if (!name || !username || !password) {
+  if (!name || !username || !password || !station) {
     return res
       .status(400)
-      .json({ message: "Name, email, and password are required." });
+      .json({ message: "Name, email, password, and station are required." });
   }
 
   const normalized = String(username).trim().toLowerCase();
@@ -26,13 +24,13 @@ router.post("/station-managers", async (req, res) => {
       return res.status(409).json({ message: "User already exists." });
     }
 
-    const passwordHash = await bcrypt.hash(String(password), 10);
     const user = await User.create({
       username: String(username).trim(),
       username_normalized: normalized,
       name: String(name).trim(),
       type: "station_manager",
-      password_hash: passwordHash
+      password_hash: String(password),
+      station: String(station).trim()
     });
 
     return res.status(201).json({
