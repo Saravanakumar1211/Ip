@@ -31,6 +31,13 @@ const emptyManagerForm = {
   password: "",
   station: ""
 };
+const emptyTruckForm = {
+  truck_id: "",
+  type: "",
+  station: "",
+  lat: "",
+  lon: ""
+};
 
 const parseNumber = (value) => {
   if (value === "" || value === null || value === undefined) {
@@ -140,6 +147,14 @@ function App() {
   const [managerError, setManagerError] = useState("");
   const [showManagerPassword, setShowManagerPassword] = useState(false);
 
+  const [truckForm, setTruckForm] = useState(emptyTruckForm);
+  const [truckEditingId, setTruckEditingId] = useState("");
+  const [truckAddOpen, setTruckAddOpen] = useState(false);
+  const [truckEditOpen, setTruckEditOpen] = useState(false);
+  const [truckSaving, setTruckSaving] = useState(false);
+  const [truckNotice, setTruckNotice] = useState("");
+  const [truckError, setTruckError] = useState("");
+
   const [managerStation, setManagerStation] = useState(null);
   const [managerTrucks, setManagerTrucks] = useState([]);
   const [managerLoading, setManagerLoading] = useState(false);
@@ -248,6 +263,11 @@ function App() {
     setStationError("");
   };
 
+  const clearTruckMessages = () => {
+    setTruckNotice("");
+    setTruckError("");
+  };
+
   const clearManagerMessages = () => {
     setManagerNotice("");
     setManagerError("");
@@ -301,6 +321,25 @@ function App() {
     });
   };
 
+  const updateTruckForm = (field, value) => {
+    clearTruckMessages();
+    setTruckForm((prev) => {
+      const next = { ...prev, [field]: value };
+      if (field === "station") {
+        const match = stations.find(
+          (item) =>
+            String(item.station || "").trim().toLowerCase() ===
+            String(value || "").trim().toLowerCase()
+        );
+        if (match?.coordinates) {
+          next.lat = match.coordinates.lat ?? "";
+          next.lon = match.coordinates.lng ?? match.coordinates.lon ?? "";
+        }
+      }
+      return next;
+    });
+  };
+
   const updateManagerStockFormField = (field, value) => {
     clearManagerDashboardMessages();
     setManagerStockForm((prev) => {
@@ -347,6 +386,11 @@ function App() {
     setStationEditingId("");
   };
 
+  const resetTruckForm = () => {
+    setTruckForm(emptyTruckForm);
+    setTruckEditingId("");
+  };
+
   const resetManagerForm = () => {
     setManagerForm(emptyManagerForm);
     setShowManagerPassword(false);
@@ -376,6 +420,16 @@ function App() {
     });
   };
 
+  const upsertTruck = (item) => {
+    setTrucks((prev) => {
+      const next = prev.filter((truck) => truck._id !== item._id);
+      next.push(item);
+      return next.sort((a, b) =>
+        String(a.truck_id || "").localeCompare(String(b.truck_id || ""))
+      );
+    });
+  };
+
   const openAddSource = () => {
     clearSourceMessages();
     resetSourceForm();
@@ -388,6 +442,13 @@ function App() {
     resetStationForm();
     setStationEditOpen(false);
     setStationAddOpen(true);
+  };
+
+  const openAddTruck = () => {
+    clearTruckMessages();
+    resetTruckForm();
+    setTruckEditOpen(false);
+    setTruckAddOpen(true);
   };
 
   const buildSourcePayload = () => {
@@ -454,6 +515,42 @@ function App() {
     };
   };
 
+  const buildTruckPayload = () => {
+    const errors = [];
+    const truckId = truckForm.truck_id.trim();
+    const type = truckForm.type.trim();
+    const station = truckForm.station.trim();
+    let lat = parseNumber(truckForm.lat);
+    let lon = parseNumber(truckForm.lon);
+
+    if (!truckId) errors.push("truck id");
+    if (!type) errors.push("truck type");
+    if (!station) errors.push("station");
+    if (lat === null || lon === null) {
+      const match = stations.find(
+        (item) =>
+          String(item.station || "").trim().toLowerCase() ===
+          station.trim().toLowerCase()
+      );
+      if (match?.coordinates) {
+        lat = match.coordinates.lat;
+        lon = match.coordinates.lng ?? match.coordinates.lon;
+      }
+    }
+    if (lat === null || lon === null) errors.push("coordinates");
+
+    return {
+      payload: {
+        truck_id: truckId,
+        type,
+        station,
+        lat,
+        lon
+      },
+      errors
+    };
+  };
+
   const handleLogin = async () => {
     setLoginError("");
     setLoginLoading(true);
@@ -506,11 +603,15 @@ function App() {
     setSourceEditOpen(false);
     setStationAddOpen(false);
     setStationEditOpen(false);
+    setTruckAddOpen(false);
+    setTruckEditOpen(false);
     closeConfirm();
     resetManagerForm();
     clearManagerMessages();
     clearSourceMessages();
     clearStationMessages();
+    clearTruckMessages();
+    resetTruckForm();
     setManagerStation(null);
     setManagerTrucks([]);
     setManagerErrorMsg("");
@@ -768,6 +869,43 @@ function App() {
     }
   };
 
+  const handleTruckSubmit = async (event) => {
+    event.preventDefault();
+    clearTruckMessages();
+
+    const { payload, errors } = buildTruckPayload();
+    if (errors.length) {
+      setTruckError(`Please provide valid ${errors.join(", ")}.`);
+      return;
+    }
+
+    setTruckSaving(true);
+
+    try {
+      const headers = { Authorization: `Bearer ${auth.token}` };
+      if (truckEditingId) {
+        const response = await axios.patch(
+          `${API_BASE}/trucks/${truckEditingId}`,
+          payload,
+          { headers }
+        );
+        upsertTruck(response.data);
+        setTruckNotice("Truck updated.");
+        setTruckEditOpen(false);
+      } else {
+        const response = await axios.post(`${API_BASE}/trucks`, payload, { headers });
+        upsertTruck(response.data);
+        setTruckNotice("Truck added.");
+        setTruckAddOpen(false);
+      }
+      resetTruckForm();
+    } catch (saveError) {
+      setTruckError(saveError.response?.data?.message || "Unable to save truck.");
+    } finally {
+      setTruckSaving(false);
+    }
+  };
+
   const handleDeleteSource = async (id) => {
     clearSourceMessages();
     setSourceSaving(true);
@@ -808,6 +946,26 @@ function App() {
     }
   };
 
+  const handleDeleteTruck = async (id) => {
+    clearTruckMessages();
+    setTruckSaving(true);
+
+    try {
+      const headers = { Authorization: `Bearer ${auth.token}` };
+      await axios.delete(`${API_BASE}/trucks/${id}`, { headers });
+      setTrucks((prev) => prev.filter((truck) => truck._id !== id));
+      if (truckEditingId === id) {
+        resetTruckForm();
+        setTruckEditOpen(false);
+      }
+      setTruckNotice("Truck deleted.");
+    } catch (deleteError) {
+      setTruckError(deleteError.response?.data?.message || "Unable to delete truck.");
+    } finally {
+      setTruckSaving(false);
+    }
+  };
+
   const startEditSource = (item) => {
     clearSourceMessages();
     setSourceAddOpen(false);
@@ -840,11 +998,27 @@ function App() {
     });
   };
 
+  const startEditTruck = (item) => {
+    clearTruckMessages();
+    setTruckAddOpen(false);
+    setTruckEditingId(item._id);
+    setTruckEditOpen(true);
+    setTruckForm({
+      truck_id: item.truck_id || "",
+      type: item.type || "",
+      station: item.station || "",
+      lat: item.lat ?? "",
+      lon: item.lon ?? ""
+    });
+  };
+
   const requestDelete = (type, item) => {
     const name =
       type === "source"
         ? item.source_name || item.source_id || "this source"
-        : item.station || "this station";
+        : type === "truck"
+          ? item.truck_id || "this truck"
+          : item.station || "this station";
     setConfirmState({ open: true, type, id: item._id, name });
   };
 
@@ -855,6 +1029,9 @@ function App() {
     }
     if (confirmState.type === "station") {
       await handleDeleteStation(confirmState.id);
+    }
+    if (confirmState.type === "truck") {
+      await handleDeleteTruck(confirmState.id);
     }
     closeConfirm();
   };
@@ -1125,13 +1302,16 @@ function App() {
                     </label>
                     <label>
                       Truck Type
-                      <input
+                      <select
                         value={managerTruckForm.type}
                         onChange={(event) =>
                           updateManagerTruckFormField("type", event.target.value)
                         }
-                        placeholder="12MT"
-                      />
+                      >
+                        <option value="">Select type</option>
+                        <option value="7MT">7MT</option>
+                        <option value="12MT">12MT</option>
+                      </select>
                     </label>
                   </div>
                   <div className="form-actions">
@@ -1871,6 +2051,89 @@ function App() {
               <div>
                 <h2>Trucks</h2>
               </div>
+              <div className="table-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    if (truckAddOpen) {
+                      setTruckAddOpen(false);
+                      clearTruckMessages();
+                    } else {
+                      openAddTruck();
+                    }
+                  }}
+                >
+                  {truckAddOpen ? "Close Add Truck" : "Add Truck"}
+                </button>
+              </div>
+            </div>
+
+            <div className={`drop-panel ${truckAddOpen ? "open" : ""}`}>
+              <form className="form-panel" onSubmit={handleTruckSubmit}>
+                <div className="form-title">Add Truck</div>
+                <div className="form-grid">
+                  <label>
+                    Truck ID
+                    <input
+                      value={truckForm.truck_id}
+                      onChange={(event) =>
+                        updateTruckForm("truck_id", event.target.value)
+                      }
+                      placeholder="T01"
+                      required
+                    />
+                  </label>
+                  <label>
+                    Truck Type
+                    <select
+                      value={truckForm.type}
+                      onChange={(event) => updateTruckForm("type", event.target.value)}
+                      required
+                    >
+                      <option value="">Select type</option>
+                      <option value="7MT">7MT</option>
+                      <option value="12MT">12MT</option>
+                    </select>
+                  </label>
+                  <label>
+                    Station
+                    <input
+                      list="truck-station-options"
+                      value={truckForm.station}
+                      onChange={(event) =>
+                        updateTruckForm("station", event.target.value)
+                      }
+                      placeholder="Station name"
+                      required
+                    />
+                  </label>
+                </div>
+                <datalist id="truck-station-options">
+                  {stations.map((station) => (
+                    <option key={station._id} value={station.station} />
+                  ))}
+                </datalist>
+                <div className="form-actions">
+                  <button type="submit" disabled={truckSaving}>
+                    Add Truck
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => {
+                      setTruckAddOpen(false);
+                      resetTruckForm();
+                      clearTruckMessages();
+                    }}
+                    disabled={truckSaving}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {truckError && <p className="notice error">{truckError}</p>}
+                {truckNotice && <p className="notice">{truckNotice}</p>}
+              </form>
             </div>
 
             <table>
@@ -1880,6 +2143,7 @@ function App() {
                   <th>Type</th>
                   <th>Station</th>
                   <th>Location</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -1903,6 +2167,26 @@ function App() {
                         ) : (
                           "-"
                         )}
+                      </td>
+                      <td>
+                        <div className="action-buttons">
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => startEditTruck(item)}
+                            disabled={truckSaving}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            onClick={() => requestDelete("truck", item)}
+                            disabled={truckSaving}
+                          >
+                            Delete
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -2069,7 +2353,11 @@ function App() {
         <div className="modal-backdrop" role="presentation">
           <div className="modal" role="dialog" aria-modal="true">
             <h3 className="modal-title">
-              {confirmState.type === "source" ? "Delete Source" : "Delete Station"}
+              {confirmState.type === "source"
+                ? "Delete Source"
+                : confirmState.type === "truck"
+                  ? "Delete Truck"
+                  : "Delete Station"}
             </h3>
             <p className="modal-sub">
               Are you sure you want to delete {confirmState.name}?
@@ -2079,7 +2367,7 @@ function App() {
                 type="button"
                 className="danger"
                 onClick={confirmDelete}
-                disabled={sourceSaving || stationSaving}
+                disabled={sourceSaving || stationSaving || truckSaving}
               >
                 Delete
               </button>
@@ -2087,7 +2375,7 @@ function App() {
                 type="button"
                 className="secondary"
                 onClick={closeConfirm}
-                disabled={sourceSaving || stationSaving}
+                disabled={sourceSaving || stationSaving || truckSaving}
               >
                 Cancel
               </button>
@@ -2315,6 +2603,92 @@ function App() {
               </div>
               {stationError && <p className="notice error">{stationError}</p>}
               {stationNotice && <p className="notice">{stationNotice}</p>}
+            </form>
+          </div>
+        </div>
+      )}
+      {truckEditOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal form-modal" role="dialog" aria-modal="true">
+            <div className="modal-header">
+              <h3 className="modal-title">
+                Update Truck
+                {truckForm.truck_id ? `: ${truckForm.truck_id}` : ""}
+              </h3>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setTruckEditOpen(false);
+                  resetTruckForm();
+                  clearTruckMessages();
+                }}
+              >
+                Close
+              </button>
+            </div>
+            <form className="modal-form" onSubmit={handleTruckSubmit}>
+              <div className="form-grid">
+                <label>
+                  Truck ID
+                  <input
+                    value={truckForm.truck_id}
+                    onChange={(event) =>
+                      updateTruckForm("truck_id", event.target.value)
+                    }
+                    placeholder="T01"
+                    required
+                  />
+                </label>
+                  <label>
+                    Truck Type
+                    <select
+                      value={truckForm.type}
+                      onChange={(event) => updateTruckForm("type", event.target.value)}
+                      required
+                    >
+                      <option value="">Select type</option>
+                      <option value="7MT">7MT</option>
+                      <option value="12MT">12MT</option>
+                    </select>
+                  </label>
+                <label>
+                  Station
+                  <input
+                    list="truck-edit-station-options"
+                    value={truckForm.station}
+                    onChange={(event) =>
+                      updateTruckForm("station", event.target.value)
+                    }
+                    placeholder="Station name"
+                    required
+                  />
+                </label>
+              </div>
+              <datalist id="truck-edit-station-options">
+                {stations.map((station) => (
+                  <option key={station._id} value={station.station} />
+                ))}
+              </datalist>
+              <div className="form-actions">
+                <button type="submit" disabled={truckSaving}>
+                  Update Truck
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setTruckEditOpen(false);
+                    resetTruckForm();
+                    clearTruckMessages();
+                  }}
+                  disabled={truckSaving}
+                >
+                  Cancel
+                </button>
+              </div>
+              {truckError && <p className="notice error">{truckError}</p>}
+              {truckNotice && <p className="notice">{truckNotice}</p>}
             </form>
           </div>
         </div>
