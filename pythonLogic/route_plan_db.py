@@ -1,6 +1,7 @@
 import os
 import sys
 import uuid
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -25,6 +26,22 @@ FAST_ROUTE = os.getenv("FAST_ROUTE", "1") != "0"
 
 def _coord_string(lat, lon):
     return f"{lat},{lon}"
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_capacity_mt(truck_type):
+    if not truck_type:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)", str(truck_type))
+    if not match:
+        return None
+    return _as_float(match.group(1))
 
 
 def road_info(olat, olon, dlat, dlon):
@@ -98,12 +115,27 @@ def build_fleet_from_db(stations, db):
         for doc in trucks_docs:
             truck_type = str(doc.get("type") or "").strip()
             caps = CAPACITY_BY_TYPE.get(truck_type, {})
+            capacity_mt = _as_float(doc.get("capacity_mt"))
+            capacity_lt = _as_float(doc.get("capacity_lt"))
+            if capacity_mt is None:
+                capacity_mt = caps.get("capacity_mt")
+            if capacity_lt is None:
+                capacity_lt = caps.get("capacity_lt")
+            if capacity_mt is None:
+                parsed = _parse_capacity_mt(truck_type)
+                if parsed is not None:
+                    capacity_mt = parsed
+                    capacity_lt = parsed * lg.MT_TO_LITERS
+            if capacity_mt is None:
+                capacity_mt = 0
+            if capacity_lt is None:
+                capacity_lt = 0
             trucks.append(
                 {
                     "truck_id": str(doc.get("truck_id")),
                     "type": truck_type,
-                    "capacity_mt": caps.get("capacity_mt", 0),
-                    "capacity_lt": caps.get("capacity_lt", 0),
+                    "capacity_mt": capacity_mt,
+                    "capacity_lt": capacity_lt,
                     "parked_station": doc.get("station"),
                     "parked_lat": float(doc.get("lat")),
                     "parked_lon": float(doc.get("lon")),

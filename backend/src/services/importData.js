@@ -188,7 +188,8 @@ const importTrucks = async () => {
             station,
             lat,
             lon,
-            type
+            type,
+            state: "atStation"
           }
         },
         upsert: true

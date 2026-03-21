@@ -134,20 +134,27 @@ const buildTruckPayload = (body) => {
   const type = String(body.type || "").trim();
   const lat = parseNumber(body.lat);
   const lon = parseNumber(body.lon);
+  const stateRaw = String(body.state || "").trim();
+  const allowedStates = ["atStation", "maintenance", "travelling"];
+  const state =
+    allowedStates.includes(stateRaw) ? stateRaw : station ? "atStation" : "travelling";
   const errors = [];
 
   if (!truckId) errors.push("truck_id");
-  if (!station) errors.push("station");
   if (!type) errors.push("type");
-  if (lat === null || lon === null) errors.push("coordinates");
+  if (state === "atStation") {
+    if (!station) errors.push("station");
+    if (lat === null || lon === null) errors.push("coordinates");
+  }
 
   return {
     payload: {
       truck_id: truckId,
-      station,
+      station: state === "atStation" ? station : null,
       type,
       lat,
-      lon
+      lon,
+      state
     },
     errors
   };

@@ -21,6 +21,17 @@ const normalizeStationKey = (value) =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "");
 
+const resolveTruckState = (truck) => {
+  const state = String(truck?.state || "").trim();
+  if (state === "atStation" || state === "maintenance" || state === "travelling") {
+    return state;
+  }
+  return truck?.station ? "atStation" : "travelling";
+};
+
+const resolveMaintenanceStation = (truck) =>
+  String(truck?.maintenance_station || "").trim();
+
 const computeStockUpdate = ({ capacity, deadStock, usable }) => {
   let nextDead = deadStock;
   let nextUsable = usable;
@@ -57,11 +68,13 @@ router.get("/overview", async (req, res) => {
     );
 
     const updates = matching
-      .filter((truck) => truck.station !== stationName)
+      .filter(
+        (truck) => truck.station !== stationName || resolveTruckState(truck) !== "atStation"
+      )
       .map((truck) => ({
         updateOne: {
           filter: { _id: truck._id },
-          update: { $set: { station: stationName } }
+          update: { $set: { station: stationName, state: "atStation" } }
         }
       }));
 
@@ -69,10 +82,22 @@ router.get("/overview", async (req, res) => {
       await Truck.bulkWrite(updates);
       matching.forEach((truck) => {
         truck.station = stationName;
+        truck.state = "atStation";
       });
     }
 
-    return res.json({ station, trucks: matching });
+    const availableTrucks = allTrucks.filter((truck) => {
+      if (resolveTruckState(truck) === "atStation") {
+        return false;
+      }
+      if (resolveTruckState(truck) !== "maintenance") {
+        return true;
+      }
+      const maintStation = resolveMaintenanceStation(truck);
+      return !maintStation || normalizeStationKey(maintStation) === stationKey;
+    });
+
+    return res.json({ station, trucks: matching, available_trucks: availableTrucks });
   } catch (error) {
     return res
       .status(500)
@@ -132,7 +157,6 @@ router.post("/trucks", async (req, res) => {
   }
 
   const truckId = String(req.body?.truck_id || "").trim();
-  const type = String(req.body?.type || "").trim();
 
   if (!truckId) {
     return res.status(400).json({ message: "Truck id is required." });
@@ -146,32 +170,40 @@ router.post("/trucks", async (req, res) => {
 
     const lat = station.coordinates?.lat;
     const lon = station.coordinates?.lng;
+    const stationKey = normalizeStationKey(stationName);
 
     const existing = await Truck.findOne({ truck_id: truckId });
-    if (existing) {
-      existing.station = stationName;
-      existing.lat = lat;
-      existing.lon = lon;
-      if (type) {
-        existing.type = type;
-      }
-      await existing.save();
-      return res.json(existing);
+    if (!existing) {
+      return res.status(404).json({ message: "Truck not found." });
     }
 
-    if (!type) {
-      return res.status(400).json({ message: "Truck type is required." });
+    const currentState = resolveTruckState(existing);
+    const maintenanceStation = resolveMaintenanceStation(existing);
+    if (
+      currentState === "maintenance" &&
+      maintenanceStation &&
+      normalizeStationKey(maintenanceStation) !== stationKey
+    ) {
+      return res
+        .status(403)
+        .json({ message: "Truck is in maintenance for another station." });
+    }
+    if (
+      currentState === "atStation" &&
+      normalizeStationKey(existing.station) !== stationKey
+    ) {
+      return res
+        .status(409)
+        .json({ message: "Truck is already parked at another station." });
     }
 
-    const created = await Truck.create({
-      truck_id: truckId,
-      station: stationName,
-      lat,
-      lon,
-      type
-    });
-
-    return res.status(201).json(created);
+    existing.station = stationName;
+    existing.lat = lat;
+    existing.lon = lon;
+    existing.state = "atStation";
+    existing.maintenance_station = null;
+    await existing.save();
+    return res.json(existing);
   } catch (error) {
     if (error?.code === 11000) {
       return res.status(409).json({ message: "Truck already exists." });
@@ -193,11 +225,18 @@ router.delete("/trucks/:id", async (req, res) => {
     if (!truck) {
       return res.status(404).json({ message: "Truck not found." });
     }
-    if (truck.station !== stationName) {
+    const stationKey = normalizeStationKey(stationName);
+    if (
+      resolveTruckState(truck) !== "atStation" ||
+      normalizeStationKey(truck.station) !== stationKey
+    ) {
       return res.status(403).json({ message: "Forbidden." });
     }
-    await Truck.findByIdAndDelete(req.params.id);
-    return res.json({ message: "Truck removed." });
+    truck.station = null;
+    truck.state = "travelling";
+    truck.maintenance_station = null;
+    await truck.save();
+    return res.json(truck);
   } catch (error) {
     if (error?.name === "CastError") {
       return res.status(400).json({ message: "Invalid truck id." });
@@ -205,6 +244,39 @@ router.delete("/trucks/:id", async (req, res) => {
     return res
       .status(500)
       .json({ message: "Unable to remove truck.", error: error.message });
+  }
+});
+
+router.patch("/trucks/:id/maintenance", async (req, res) => {
+  const stationName = resolveStationName(req);
+  if (!stationName) {
+    return res.status(400).json({ message: "Station assignment missing." });
+  }
+
+  try {
+    const truck = await Truck.findById(req.params.id);
+    if (!truck) {
+      return res.status(404).json({ message: "Truck not found." });
+    }
+    const stationKey = normalizeStationKey(stationName);
+    if (
+      resolveTruckState(truck) !== "atStation" ||
+      normalizeStationKey(truck.station) !== stationKey
+    ) {
+      return res.status(403).json({ message: "Forbidden." });
+    }
+    truck.station = null;
+    truck.state = "maintenance";
+    truck.maintenance_station = stationName;
+    await truck.save();
+    return res.json(truck);
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res.status(400).json({ message: "Invalid truck id." });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to update truck state.", error: error.message });
   }
 });
 

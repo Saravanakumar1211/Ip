@@ -161,11 +161,12 @@ function App() {
   const [managerErrorMsg, setManagerErrorMsg] = useState("");
   const [managerNoticeMsg, setManagerNoticeMsg] = useState("");
   const [managerAlertMsg, setManagerAlertMsg] = useState("");
-  const [managerTruckForm, setManagerTruckForm] = useState({ truck_id: "", type: "" });
+  const [managerTruckForm, setManagerTruckForm] = useState({ truck_id: "" });
   const [managerStockForm, setManagerStockForm] = useState({
     dead_stock_in_lt: "",
     usable_lt: ""
   });
+  const [managerAvailableTrucks, setManagerAvailableTrucks] = useState([]);
   const [managerTruckSaving, setManagerTruckSaving] = useState(false);
   const [managerStockSaving, setManagerStockSaving] = useState(false);
 
@@ -182,6 +183,14 @@ function App() {
       ),
     [stations]
   );
+  const selectedAvailableTruck = useMemo(
+    () =>
+      managerAvailableTrucks.find(
+        (truck) => String(truck.truck_id) === managerTruckForm.truck_id
+      ),
+    [managerAvailableTrucks, managerTruckForm.truck_id]
+  );
+  const noAvailableTrucks = managerAvailableTrucks.length === 0;
 
 
 
@@ -376,6 +385,51 @@ function App() {
     setManagerTruckForm((prev) => ({ ...prev, [field]: value }));
   };
 
+  const resolveTruckState = (truck) => {
+    const state = String(truck?.state || "").trim();
+    if (state === "atStation" || state === "maintenance" || state === "travelling") {
+      return state;
+    }
+    return truck?.station ? "atStation" : "travelling";
+  };
+
+  const getStationCoordinates = (stationName) => {
+    if (!stationName) return null;
+    const match = stations.find(
+      (station) =>
+        String(station.station || "").trim().toLowerCase() ===
+        String(stationName || "").trim().toLowerCase()
+    );
+    return match?.coordinates || null;
+  };
+
+  const formatCapacity = (value) => {
+    if (value === null || value === undefined) return "";
+    const raw = String(value).trim();
+    if (!raw) return "";
+    const match = raw.match(/(\d+(?:\.\d+)?)/);
+    return match ? match[1] : raw;
+  };
+
+  const buildDeliverySequence = (plan) => {
+    if (!plan) return "";
+    const sequence = [];
+    const initial = plan.initial_park || "Unknown start";
+    sequence.push(initial);
+    const sourceLabel = plan.source_name || plan.source_id || "Source";
+    sequence.push(sourceLabel);
+    const stops = (plan.stops || [])
+      .map((stop) => stop.station)
+      .filter(Boolean);
+    if (stops.length) {
+      sequence.push(...stops);
+    }
+    if (plan.final_park) {
+      sequence.push(plan.final_park);
+    }
+    return sequence.join(" -> ");
+  };
+
   const resetSourceForm = () => {
     setSourceForm(emptySourceForm);
     setSourceEditingId("");
@@ -524,7 +578,7 @@ function App() {
     let lon = parseNumber(truckForm.lon);
 
     if (!truckId) errors.push("truck id");
-    if (!type) errors.push("truck type");
+    if (!type) errors.push("capacity in mt");
     if (!station) errors.push("station");
     if (lat === null || lon === null) {
       const match = stations.find(
@@ -617,8 +671,9 @@ function App() {
     setManagerErrorMsg("");
     setManagerNoticeMsg("");
     setManagerAlertMsg("");
-    setManagerTruckForm({ truck_id: "", type: "" });
+    setManagerTruckForm({ truck_id: "" });
     setManagerStockForm({ dead_stock_in_lt: "", usable_lt: "" });
+    setManagerAvailableTrucks([]);
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(FORM_STORAGE_KEY);
     window.history.replaceState(null, "", "#");
@@ -655,6 +710,7 @@ function App() {
       const station = response.data.station;
       setManagerStation(station);
       setManagerTrucks(response.data.trucks || []);
+      setManagerAvailableTrucks(response.data.available_trucks || []);
       setManagerStockForm({
         dead_stock_in_lt: station?.dead_stock_in_lt ?? "",
         usable_lt: station?.usable_lt ?? ""
@@ -732,9 +788,11 @@ function App() {
     clearManagerDashboardMessages();
 
     const truckId = managerTruckForm.truck_id.trim();
-    const type = managerTruckForm.type.trim();
-    if (!truckId) {
-      setManagerErrorMsg("Please provide a truck id.");
+    const selectedTruck = managerAvailableTrucks.find(
+      (truck) => String(truck.truck_id) === truckId
+    );
+    if (!truckId || !selectedTruck) {
+      setManagerErrorMsg("Please select a valid truck.");
       return;
     }
 
@@ -744,7 +802,7 @@ function App() {
       const headers = { Authorization: `Bearer ${auth.token}` };
       const response = await axios.post(
         `${API_BASE}/manager/trucks`,
-        { truck_id: truckId, type },
+        { truck_id: truckId },
         { headers }
       );
       setManagerTrucks((prev) => {
@@ -754,8 +812,11 @@ function App() {
           String(a.truck_id || "").localeCompare(String(b.truck_id || ""))
         );
       });
+      setManagerAvailableTrucks((prev) =>
+        prev.filter((truck) => truck._id !== selectedTruck._id)
+      );
       setManagerNoticeMsg("Truck saved for this station.");
-      setManagerTruckForm({ truck_id: "", type: "" });
+      setManagerTruckForm({ truck_id: "" });
     } catch (saveError) {
       setManagerErrorMsg(
         saveError.response?.data?.message || "Unable to save truck."
@@ -771,12 +832,55 @@ function App() {
 
     try {
       const headers = { Authorization: `Bearer ${auth.token}` };
-      await axios.delete(`${API_BASE}/manager/trucks/${truckId}`, { headers });
+      const response = await axios.delete(`${API_BASE}/manager/trucks/${truckId}`, {
+        headers
+      });
       setManagerTrucks((prev) => prev.filter((truck) => truck._id !== truckId));
+      if (response.data?._id) {
+        setManagerAvailableTrucks((prev) => {
+          const next = prev.filter((truck) => truck._id !== response.data._id);
+          next.push(response.data);
+          return next.sort((a, b) =>
+            String(a.truck_id || "").localeCompare(String(b.truck_id || ""))
+          );
+        });
+      }
       setManagerNoticeMsg("Truck removed from this station.");
     } catch (removeError) {
       setManagerErrorMsg(
         removeError.response?.data?.message || "Unable to remove truck."
+      );
+    } finally {
+      setManagerTruckSaving(false);
+    }
+  };
+
+  const handleManagerTruckMaintenance = async (truckId) => {
+    clearManagerDashboardMessages();
+    setManagerTruckSaving(true);
+
+    try {
+      const headers = { Authorization: `Bearer ${auth.token}` };
+      const response = await axios.patch(
+        `${API_BASE}/manager/trucks/${truckId}/maintenance`,
+        {},
+        { headers }
+      );
+      setManagerTrucks((prev) => prev.filter((truck) => truck._id !== truckId));
+      if (response.data?._id) {
+        setManagerAvailableTrucks((prev) => {
+          const next = prev.filter((truck) => truck._id !== response.data._id);
+          next.push(response.data);
+          return next.sort((a, b) =>
+            String(a.truck_id || "").localeCompare(String(b.truck_id || ""))
+          );
+        });
+      }
+      setManagerNoticeMsg("Truck sent to maintenance.");
+    } catch (maintenanceError) {
+      setManagerErrorMsg(
+        maintenanceError.response?.data?.message ||
+          "Unable to send truck to maintenance."
       );
     } finally {
       setManagerTruckSaving(false);
@@ -1005,7 +1109,7 @@ function App() {
     setTruckEditOpen(true);
     setTruckForm({
       truck_id: item.truck_id || "",
-      type: item.type || "",
+      type: formatCapacity(item.type || ""),
       station: item.station || "",
       lat: item.lat ?? "",
       lon: item.lon ?? ""
@@ -1292,40 +1396,45 @@ function App() {
                   <div className="form-grid">
                     <label>
                       Truck ID
-                      <input
+                      <select
                         value={managerTruckForm.truck_id}
                         onChange={(event) =>
                           updateManagerTruckFormField("truck_id", event.target.value)
                         }
-                        placeholder="T01"
-                      />
+                        disabled={noAvailableTrucks}
+                      >
+                        <option value="">Select truck</option>
+                        {managerAvailableTrucks.map((truck) => (
+                          <option key={truck._id} value={truck.truck_id}>
+                            {truck.truck_id}
+                            {truck.type ? ` (${formatCapacity(truck.type)})` : ""}
+                          </option>
+                        ))}
+                      </select>
                     </label>
                     <label>
-                      Truck Type
-                      <select
-                        value={managerTruckForm.type}
-                        onChange={(event) =>
-                          updateManagerTruckFormField("type", event.target.value)
-                        }
-                      >
-                        <option value="">Select type</option>
-                        <option value="7MT">7MT</option>
-                        <option value="12MT">12MT</option>
-                      </select>
+                      Capacity (MT)
+                      <input
+                        value={formatCapacity(selectedAvailableTruck?.type || "")}
+                        readOnly
+                      />
                     </label>
                   </div>
                   <div className="form-actions">
-                    <button type="submit" disabled={managerTruckSaving}>
+                    <button type="submit" disabled={managerTruckSaving || noAvailableTrucks}>
                       {managerTruckSaving ? "Saving..." : "Add Truck"}
                     </button>
                   </div>
                 </form>
+                {noAvailableTrucks && (
+                  <p className="notice">No available trucks to add right now.</p>
+                )}
 
                 <table>
                   <thead>
                     <tr>
                       <th>Truck ID</th>
-                      <th>Type</th>
+                      <th>Capacity (MT)</th>
                       <th>Location</th>
                       <th>Actions</th>
                     </tr>
@@ -1337,7 +1446,7 @@ function App() {
                         return (
                           <tr key={truck._id}>
                             <td>{truck.truck_id}</td>
-                            <td>{truck.type}</td>
+                            <td>{formatCapacity(truck.type) || "-"}</td>
                             <td>
                               {mapUrl ? (
                                 <a
@@ -1353,14 +1462,24 @@ function App() {
                               )}
                             </td>
                             <td>
-                              <button
-                                type="button"
-                                className="danger"
-                                onClick={() => handleManagerTruckRemove(truck._id)}
-                                disabled={managerTruckSaving}
-                              >
-                                Remove
-                              </button>
+                              <div className="action-buttons">
+                                <button
+                                  type="button"
+                                  className="danger"
+                                  onClick={() => handleManagerTruckRemove(truck._id)}
+                                  disabled={managerTruckSaving}
+                                >
+                                  Remove
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  onClick={() => handleManagerTruckMaintenance(truck._id)}
+                                  disabled={managerTruckSaving}
+                                >
+                                  Sent to Maintenance
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -1483,9 +1602,10 @@ function App() {
                           <div className="plan-card-header">
                             <div>
                               <h5>
-                                Truck {plan.truck_id} - Source {plan.source_id}
+                                Truck {plan.truck_id} - Source{" "}
+                                {plan.source_name || plan.source_id}
                               </h5>
-                              <p>Stops: {stops.map((s) => s.station).join(" -> ")}</p>
+                              <p>Delivery sequence: {buildDeliverySequence(plan)}</p>
                             </div>
                             <div>
                               <span className="pill">
@@ -1537,7 +1657,7 @@ function App() {
                         <thead>
                           <tr>
                             <th>Truck</th>
-                            <th>Type</th>
+                            <th>Capacity (MT)</th>
                             <th>Final Station</th>
                             <th>Location</th>
                           </tr>
@@ -1551,7 +1671,7 @@ function App() {
                             return (
                               <tr key={truck.truck_id}>
                                 <td>{truck.truck_id}</td>
-                                <td>{truck.type}</td>
+                                <td>{formatCapacity(truck.type) || "-"}</td>
                                 <td>{truck.station}</td>
                                 <td>
                                   {mapUrl ? (
@@ -1603,20 +1723,28 @@ function App() {
                     <thead>
                       <tr>
                         <th>Truck</th>
-                        <th>Source</th>
+                        <th>Source Name</th>
                         <th>Stations</th>
                         <th>Grand Total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {costSummary.map((row) => (
-                        <tr key={`${row.truck_id}-${row.source_id}`}>
-                          <td>{row.truck_id}</td>
-                          <td>{row.source_id}</td>
-                          <td>{row.stations?.join(" -> ")}</td>
-                          <td>{numberFmt.format(row.grand_total)}</td>
-                        </tr>
-                      ))}
+                      {costSummary.map((row) => {
+                        const plan = deliveryPlans.find(
+                          (item) =>
+                            item.truck_id === row.truck_id &&
+                            item.source_id === row.source_id
+                        );
+                        const sourceLabel = plan?.source_name || row.source_id;
+                        return (
+                          <tr key={`${row.truck_id}-${row.source_id}`}>
+                            <td>{row.truck_id}</td>
+                            <td>{sourceLabel}</td>
+                            <td>{row.stations?.join(" -> ")}</td>
+                            <td>{numberFmt.format(row.grand_total)}</td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </section>
@@ -2084,18 +2212,17 @@ function App() {
                       required
                     />
                   </label>
-                  <label>
-                    Truck Type
-                    <select
-                      value={truckForm.type}
-                      onChange={(event) => updateTruckForm("type", event.target.value)}
-                      required
-                    >
-                      <option value="">Select type</option>
-                      <option value="7MT">7MT</option>
-                      <option value="12MT">12MT</option>
-                    </select>
-                  </label>
+                <label>
+                  Capacity (MT)
+                  <input
+                    type="number"
+                    step="any"
+                    value={truckForm.type}
+                    onChange={(event) => updateTruckForm("type", event.target.value)}
+                    placeholder="9"
+                    required
+                  />
+                </label>
                   <label>
                     Station
                     <input
@@ -2137,35 +2264,48 @@ function App() {
             </div>
 
             <table>
-              <thead>
-                <tr>
-                  <th>Truck ID</th>
-                  <th>Type</th>
-                  <th>Station</th>
-                  <th>Location</th>
-                  <th>Actions</th>
+                <thead>
+                  <tr>
+                    <th>Truck ID</th>
+                    <th>Capacity (MT)</th>
+                    <th>Station</th>
+                    <th>Location</th>
+                    <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {trucks.map((item) => {
-                  const mapUrl = toMapUrl({ lat: item.lat, lon: item.lon });
+                  const state = resolveTruckState(item);
+                  const stationCoords =
+                    state === "atStation" ? getStationCoordinates(item.station) : null;
+                  const coords =
+                    stationCoords ?? (state === "atStation"
+                      ? { lat: item.lat, lng: item.lon }
+                      : null);
+                  const mapUrl = toMapUrl(coords);
+                  const locationLabel =
+                    state === "atStation"
+                      ? coords
+                        ? `${coords.lat}, ${coords.lng ?? coords.lon}`
+                        : "-"
+                      : state;
                   return (
                     <tr key={item._id}>
                       <td>{item.truck_id}</td>
-                      <td>{item.type}</td>
+                      <td>{formatCapacity(item.type) || "-"}</td>
                       <td>{item.station}</td>
                       <td>
-                        {mapUrl ? (
+                        {state === "atStation" && mapUrl ? (
                           <a
                             className="location-link"
                             href={mapUrl}
                             target="_blank"
                             rel="noreferrer"
                           >
-                            {item.lat}, {item.lon}
+                            {locationLabel}
                           </a>
                         ) : (
-                          "-"
+                          locationLabel || "-"
                         )}
                       </td>
                       <td>
@@ -2641,16 +2781,15 @@ function App() {
                   />
                 </label>
                   <label>
-                    Truck Type
-                    <select
+                    Capacity (MT)
+                    <input
+                      type="number"
+                      step="any"
                       value={truckForm.type}
                       onChange={(event) => updateTruckForm("type", event.target.value)}
+                      placeholder="9"
                       required
-                    >
-                      <option value="">Select type</option>
-                      <option value="7MT">7MT</option>
-                      <option value="12MT">12MT</option>
-                    </select>
+                    />
                   </label>
                 <label>
                   Station
