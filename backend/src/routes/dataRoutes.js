@@ -10,10 +10,13 @@ import { Truck } from "../models/truck.js";
 import { Delivery } from "../models/delivery.js";
 import { TruckPlanning } from "../models/truckPlanning.js";
 import { TentativeCost } from "../models/tentativeCost.js";
+import { UnservedStations } from "../models/unservedStations.js";
 import { runImport } from "../services/importData.js";
 import { authenticate, requireRole } from "../middleware/auth.js";
 
 const router = Router();
+
+const MT_TO_LITERS = 1810;
 
 const parseNumber = (value) => {
   if (value === "" || value === null || value === undefined) {
@@ -197,13 +200,64 @@ const runRoutePlanner = (planId) =>
   });
 
 const fetchPlanBundle = async (planId) => {
-  const [delivery, truckPlanning, tentativeCost] = await Promise.all([
+  const [delivery, truckPlanning, tentativeCost, unserved] = await Promise.all([
     Delivery.findOne({ plan_id: planId }).lean(),
     TruckPlanning.findOne({ plan_id: planId }).lean(),
-    TentativeCost.findOne({ plan_id: planId }).lean()
+    TentativeCost.findOne({ plan_id: planId }).lean(),
+    UnservedStations.findOne({ plan_id: planId }).lean()
   ]);
 
-  return { delivery, truckPlanning, tentativeCost };
+  return { delivery, truckPlanning, tentativeCost, unserved };
+};
+
+const normalizeDecision = (value) => {
+  const parsed = String(value || "")
+    .trim()
+    .toUpperCase();
+  if (parsed === "ACCEPTED" || parsed === "REJECTED") {
+    return parsed;
+  }
+  return "PENDING";
+};
+
+const recomputeUnservedSummary = (doc) => {
+  const resolutions = Array.isArray(doc?.resolutions) ? doc.resolutions : [];
+  const pending = resolutions.filter(
+    (item) => normalizeDecision(item?.decision) === "PENDING"
+  );
+  const accepted = resolutions.filter(
+    (item) => normalizeDecision(item?.decision) === "ACCEPTED"
+  ).length;
+  const rejected = resolutions.filter(
+    (item) => normalizeDecision(item?.decision) === "REJECTED"
+  ).length;
+
+  const summary = {
+    total: pending.length,
+    today: 0,
+    tomorrow: 0,
+    manual_review: 0,
+    swap_suggestions: 0,
+    pending: pending.length,
+    accepted,
+    rejected
+  };
+
+  pending.forEach((item) => {
+    const when = String(item?.when || "").trim().toUpperCase();
+    if (when === "TODAY") {
+      summary.today += 1;
+    } else if (when === "TOMORROW") {
+      summary.tomorrow += 1;
+    } else {
+      summary.manual_review += 1;
+    }
+    if (item?.swap_candidate) {
+      summary.swap_suggestions += 1;
+    }
+  });
+
+  return summary;
 };
 
 router.use(authenticate);
@@ -445,6 +499,198 @@ router.get("/route-plan/:planId", async (req, res) => {
     return res.json({ plan_id: req.params.planId, ...bundle });
   } catch (error) {
     return res.status(500).json({ message: "Failed to load route plan.", error: error.message });
+  }
+});
+
+router.post("/route-plan/:planId/unserved/:resolutionId/decision", async (req, res) => {
+  const { planId, resolutionId } = req.params;
+  const decisionRaw = String(req.body?.decision || "").trim().toUpperCase();
+  if (!["ACCEPT", "REJECT"].includes(decisionRaw)) {
+    return res
+      .status(400)
+      .json({ message: "Decision must be ACCEPT or REJECT." });
+  }
+
+  try {
+    const unservedDoc = await UnservedStations.findOne({ plan_id: planId });
+    if (!unservedDoc) {
+      return res.status(404).json({ message: "Unserved plan not found." });
+    }
+
+    const resolution = unservedDoc.resolutions?.find(
+      (item) => item.resolution_id === resolutionId
+    );
+    if (!resolution) {
+      return res.status(404).json({ message: "Resolution not found." });
+    }
+
+    if (normalizeDecision(resolution.decision) !== "PENDING") {
+      return res.status(409).json({ message: "This suggestion was already decided." });
+    }
+
+    resolution.decision = decisionRaw === "ACCEPT" ? "ACCEPTED" : "REJECTED";
+    resolution.decided_at = new Date();
+
+    const matchedUnserved = unservedDoc.unserved?.find((item) => {
+      if (resolution.unserved_id && item?.unserved_id) {
+        return item.unserved_id === resolution.unserved_id;
+      }
+      return (
+        String(item?.station || "").trim() === String(resolution.station || "").trim() &&
+        Number(item?.needed_lt || 0) === Number(resolution.needed_lt || 0)
+      );
+    });
+
+    if (decisionRaw === "ACCEPT") {
+      const swap = resolution.swap_detail;
+      if (!swap?.truck_id || !swap?.drop_station || !resolution.station) {
+        return res
+          .status(400)
+          .json({ message: "No swap details available for this suggestion." });
+      }
+
+      const deliveryDoc = await Delivery.findOne({ plan_id: planId });
+      if (!deliveryDoc) {
+        return res.status(404).json({ message: "Delivery plan not found." });
+      }
+
+      const plan = deliveryDoc.delivery_plans?.find(
+        (item) => item.truck_id === swap.truck_id
+      );
+      if (!plan) {
+        return res.status(400).json({ message: "Truck plan not found." });
+      }
+
+      const dropIndex = (plan.stops || []).findIndex(
+        (stop) => stop.station === swap.drop_station
+      );
+      if (dropIndex === -1) {
+        return res.status(400).json({ message: "Drop station not found in plan." });
+      }
+
+      const droppedStop = plan.stops[dropIndex];
+      const newStop = {
+        station: resolution.station,
+        needed_lt: resolution.needed_lt,
+        needed_mt: resolution.needed_mt,
+        station_lat: resolution.station_lat,
+        station_lon: resolution.station_lon
+      };
+
+      plan.stops.splice(dropIndex, 1, newStop);
+      const totalLt = plan.stops.reduce(
+        (sum, stop) => sum + (Number(stop.needed_lt) || 0),
+        0
+      );
+      plan.total_lt = Math.round(totalLt);
+      plan.total_mt = Number((plan.total_lt / MT_TO_LITERS).toFixed(3));
+
+      const finalStop = plan.stops[plan.stops.length - 1];
+      if (finalStop?.station) {
+        plan.final_park = finalStop.station;
+        plan.final_lat = finalStop.station_lat ?? plan.final_lat;
+        plan.final_lon = finalStop.station_lon ?? plan.final_lon;
+      }
+
+      if (Array.isArray(plan.journey_steps)) {
+        const step = plan.journey_steps.find(
+          (item) => item.step_type === "DELIVER" && item.location === swap.drop_station
+        );
+        if (step) {
+          step.location = resolution.station;
+          step.qty_lt = resolution.needed_lt;
+          step.qty_mt = resolution.needed_mt;
+          step.note = "Updated by swap suggestion";
+        }
+
+        const finalStep = plan.journey_steps.find(
+          (item) => item.step_type === "FINAL_PARK"
+        );
+        if (finalStep && finalStop?.station) {
+          finalStep.location = finalStop.station;
+          finalStep.note = "Updated final park after swap suggestion";
+        }
+      }
+
+      plan.swap_applied = {
+        resolution_id: resolutionId,
+        dropped_station: swap.drop_station,
+        added_station: resolution.station,
+        dropped_station_needed_lt: droppedStop?.needed_lt ?? null,
+        decided_at: new Date()
+      };
+
+      const fleetRow = deliveryDoc.fleet_status?.find(
+        (item) => item.truck_id === plan.truck_id
+      );
+      if (fleetRow && finalStop?.station) {
+        fleetRow.final_park = finalStop.station;
+        deliveryDoc.markModified("fleet_status");
+      }
+
+      deliveryDoc.markModified("delivery_plans");
+      await deliveryDoc.save();
+
+      const truckPlanningDoc = await TruckPlanning.findOne({ plan_id: planId });
+      if (truckPlanningDoc) {
+        const truck = truckPlanningDoc.truck_positions?.find(
+          (item) => item.truck_id === plan.truck_id
+        );
+        if (truck && finalStop?.station) {
+          truck.station = finalStop.station;
+          truck.lat = finalStop.station_lat ?? truck.lat;
+          truck.lon = finalStop.station_lon ?? truck.lon;
+          truckPlanningDoc.markModified("truck_positions");
+          await truckPlanningDoc.save();
+        }
+      }
+
+      const tentativeDoc = await TentativeCost.findOne({ plan_id: planId });
+      if (tentativeDoc) {
+        const row = tentativeDoc.cost_summary?.find(
+          (item) => item.truck_id === plan.truck_id && item.source_id === plan.source_id
+        );
+        if (row) {
+          row.stations = plan.stops.map((stop) => stop.station);
+          tentativeDoc.markModified("cost_summary");
+          await tentativeDoc.save();
+        }
+      }
+
+      resolution.applied_swap = {
+        truck_id: swap.truck_id,
+        dropped_station: swap.drop_station,
+        added_station: resolution.station,
+        applied_at: new Date()
+      };
+      resolution.summary =
+        `Swapped '${swap.drop_station}' out from truck ${swap.truck_id} and ` +
+        `added '${resolution.station}' into the same sequence.`;
+
+      if (matchedUnserved) {
+        matchedUnserved.status = "RESOLVED_BY_SWAP";
+        matchedUnserved.resolution_id = resolutionId;
+        matchedUnserved.decided_at = new Date();
+      }
+    } else if (matchedUnserved) {
+      matchedUnserved.status = "UNSERVED";
+      matchedUnserved.resolution_id = resolutionId;
+      matchedUnserved.decided_at = new Date();
+    }
+
+    unservedDoc.summary = recomputeUnservedSummary(unservedDoc);
+    unservedDoc.markModified("summary");
+    unservedDoc.markModified("unserved");
+    unservedDoc.markModified("resolutions");
+    await unservedDoc.save();
+
+    const bundle = await fetchPlanBundle(planId);
+    return res.json({ plan_id: planId, ...bundle });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to update swap decision.",
+      error: error.message
+    });
   }
 });
 

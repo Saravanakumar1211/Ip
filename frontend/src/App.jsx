@@ -413,6 +413,29 @@ function App() {
 
   const buildDeliverySequence = (plan) => {
     if (!plan) return "";
+    const steps = plan.journey_steps || plan.journeySteps;
+    if (Array.isArray(steps) && steps.length) {
+      const sequence = steps
+        .map((step) => {
+          if (!step) return "";
+          if (step.step_type === "LOAD") {
+            return `${step.location} (Load)`;
+          }
+          if (step.step_type === "RELOAD") {
+            return `${step.location} (Reload)`;
+          }
+          if (step.step_type === "INITIAL_PARK") {
+            return `${step.location} (Start)`;
+          }
+          if (step.step_type === "FINAL_PARK") {
+            return `${step.location} (End)`;
+          }
+          return step.location || step.label || "";
+        })
+        .filter(Boolean);
+      return sequence.join(" -> ");
+    }
+
     const sequence = [];
     const initial = plan.initial_park || "Unknown start";
     sequence.push(initial);
@@ -1605,11 +1628,16 @@ function App() {
                                 Truck {plan.truck_id} - Source{" "}
                                 {plan.source_name || plan.source_id}
                               </h5>
-                              <p>Delivery sequence: {buildDeliverySequence(plan)}</p>
+                              <p className="delivery-sequence">
+                                Delivery sequence: {buildDeliverySequence(plan)}
+                              </p>
                             </div>
-                            <div>
-                              <span className="pill">
-                                Total Lt {numberFmt.format(plan.total_lt)}
+                            <div className="plan-total-chip">
+                              <span className="plan-total-label">
+                                Total Delivered
+                              </span>
+                              <span className="plan-total-value">
+                                {numberFmt.format(plan.total_lt || 0)} Lt
                               </span>
                             </div>
                           </div>
@@ -2352,7 +2380,7 @@ function App() {
                 <tr>
                   <th>Station</th>
                   <th>Location</th>
-                  <th>Usable Lt</th>
+                  <th>Dead Stock Lt</th>
                   <th>Sufficient Fuel</th>
                 </tr>
               </thead>
@@ -2376,7 +2404,7 @@ function App() {
                           "-"
                         )}
                       </td>
-                      <td>{numberFmt.format(item.usable_lt)}</td>
+                      <td>{numberFmt.format(item.dead_stock_in_lt || 0)}</td>
                       <td>{item.sufficient_fuel || "-"}</td>
                     </tr>
                   );
