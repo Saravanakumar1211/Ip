@@ -10,6 +10,7 @@ import userRoutes from "./routes/userRoutes.js";
 import managerRoutes from "./routes/managerRoutes.js";
 import { ensureAdminUser } from "./services/ensureAdminUser.js";
 import { seedStationManagers } from "./services/seedStationManagers.js";
+import { ensureTruckStates } from "./services/ensureTruckStates.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
 
@@ -33,6 +34,7 @@ connectDB()
     return ensureAdminUser();
   })
   .then(() => seedStationManagers())
+  .then(() => ensureTruckStates())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Backend server running at http://localhost:${PORT}`);

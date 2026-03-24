@@ -430,6 +430,42 @@ button.danger {
   font-size: 13px;
 }
 
+.plan-total-chip {
+  min-width: 180px;
+  background: #e8f4ec;
+  border: 1px solid var(--green-200);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 4px;
+  text-align: right;
+}
+
+.plan-total-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #42664d;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.plan-total-value {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--green-900);
+}
+
+.delivery-sequence {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.45;
+  color: var(--green-900);
+  background: #eef8f1;
+  padding: 8px 10px;
+  border-radius: 10px;
+  display: inline-block;
+}
+
 .plan-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -602,6 +638,15 @@ input:focus {
 
   .form-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .plan-card-header {
+    flex-direction: column;
+  }
+
+  .plan-total-chip {
+    width: 100%;
+    text-align: left;
   }
 }
 
