@@ -1,6 +1,7 @@
 import { Router } from "express";
 
 import { authenticate, requireRole } from "../middleware/auth.js";
+import { Source } from "../models/source.js";
 import { Station } from "../models/station.js";
 import { Truck } from "../models/truck.js";
 
@@ -23,8 +24,16 @@ const normalizeStationKey = (value) =>
 
 const resolveTruckState = (truck) => {
   const state = String(truck?.state || "").trim();
-  if (state === "atStation" || state === "maintenance" || state === "travelling") {
+  if (
+    state === "atStation" ||
+    state === "atSource" ||
+    state === "atMaintenance" ||
+    state === "travelling"
+  ) {
     return state;
+  }
+  if (truck?.source) {
+    return "atSource";
   }
   return truck?.station ? "atStation" : "travelling";
 };
@@ -61,6 +70,14 @@ router.get("/overview", async (req, res) => {
     if (!station) {
       return res.status(404).json({ message: "Station not found." });
     }
+    const sourceRows = await Source.find()
+      .sort({ source_id: 1 })
+      .select("source_id source_name coordinates");
+    const sourceOptions = sourceRows.map((source) => ({
+      source_id: source.source_id,
+      source_name: source.source_name,
+      coordinates: source.coordinates || null
+    }));
     const stationKey = normalizeStationKey(stationName);
     const allTrucks = await Truck.find().sort({ truck_id: 1 });
     const matching = allTrucks.filter(
@@ -74,7 +91,14 @@ router.get("/overview", async (req, res) => {
       .map((truck) => ({
         updateOne: {
           filter: { _id: truck._id },
-          update: { $set: { station: stationName, state: "atStation" } }
+          update: {
+            $set: {
+              station: stationName,
+              state: "atStation",
+              source: null,
+              source_id: null
+            }
+          }
         }
       }));
 
@@ -83,6 +107,8 @@ router.get("/overview", async (req, res) => {
       matching.forEach((truck) => {
         truck.station = stationName;
         truck.state = "atStation";
+        truck.source = null;
+        truck.source_id = null;
       });
     }
 
@@ -90,14 +116,19 @@ router.get("/overview", async (req, res) => {
       if (resolveTruckState(truck) === "atStation") {
         return false;
       }
-      if (resolveTruckState(truck) !== "maintenance") {
+      if (resolveTruckState(truck) !== "atMaintenance") {
         return true;
       }
       const maintStation = resolveMaintenanceStation(truck);
       return !maintStation || normalizeStationKey(maintStation) === stationKey;
     });
 
-    return res.json({ station, trucks: matching, available_trucks: availableTrucks });
+    return res.json({
+      station,
+      trucks: matching,
+      available_trucks: availableTrucks,
+      sources: sourceOptions
+    });
   } catch (error) {
     return res
       .status(500)
@@ -180,7 +211,7 @@ router.post("/trucks", async (req, res) => {
     const currentState = resolveTruckState(existing);
     const maintenanceStation = resolveMaintenanceStation(existing);
     if (
-      currentState === "maintenance" &&
+      currentState === "atMaintenance" &&
       maintenanceStation &&
       normalizeStationKey(maintenanceStation) !== stationKey
     ) {
@@ -198,6 +229,8 @@ router.post("/trucks", async (req, res) => {
     }
 
     existing.station = stationName;
+    existing.source = null;
+    existing.source_id = null;
     existing.lat = lat;
     existing.lon = lon;
     existing.state = "atStation";
@@ -232,7 +265,37 @@ router.delete("/trucks/:id", async (req, res) => {
     ) {
       return res.status(403).json({ message: "Forbidden." });
     }
+
+    const target = String(req.body?.target || "").trim().toLowerCase();
+    const sourceId = String(req.body?.source_id || req.body?.sourceId || "").trim();
+    const sourceName = String(
+      req.body?.source_name || req.body?.source || ""
+    ).trim();
+    const sendToSource = target === "source" || sourceId || sourceName;
+
+    if (sendToSource) {
+      const source = await Source.findOne(
+        sourceId ? { source_id: sourceId } : { source_name: sourceName }
+      ).select("source_id source_name coordinates");
+
+      if (!source) {
+        return res.status(404).json({ message: "Source not found." });
+      }
+
+      truck.station = null;
+      truck.source = source.source_name;
+      truck.source_id = source.source_id;
+      truck.state = "atSource";
+      truck.maintenance_station = null;
+      truck.lat = source.coordinates?.lat ?? null;
+      truck.lon = source.coordinates?.lng ?? source.coordinates?.lon ?? null;
+      await truck.save();
+      return res.json(truck);
+    }
+
     truck.station = null;
+    truck.source = null;
+    truck.source_id = null;
     truck.state = "travelling";
     truck.maintenance_station = null;
     await truck.save();
@@ -266,7 +329,9 @@ router.patch("/trucks/:id/maintenance", async (req, res) => {
       return res.status(403).json({ message: "Forbidden." });
     }
     truck.station = null;
-    truck.state = "maintenance";
+    truck.source = null;
+    truck.source_id = null;
+    truck.state = "atMaintenance";
     truck.maintenance_station = stationName;
     await truck.save();
     return res.json(truck);

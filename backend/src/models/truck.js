@@ -4,13 +4,15 @@ const truckSchema = new mongoose.Schema(
   {
     truck_id: { type: String, required: true, unique: true, trim: true },
     station: { type: String, trim: true, default: null },
+    source: { type: String, trim: true, default: null },
+    source_id: { type: String, trim: true, default: null },
     lat: { type: Number, default: null },
     lon: { type: Number, default: null },
     type: { type: String, required: true, trim: true },
     maintenance_station: { type: String, trim: true, default: null },
     state: {
       type: String,
-      enum: ["atStation", "maintenance", "travelling"],
+      enum: ["atStation", "atSource", "atMaintenance", "travelling"],
       default: "travelling"
     }
   },

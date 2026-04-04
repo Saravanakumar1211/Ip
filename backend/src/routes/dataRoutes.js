@@ -11,6 +11,7 @@ import { Delivery } from "../models/delivery.js";
 import { TruckPlanning } from "../models/truckPlanning.js";
 import { TentativeCost } from "../models/tentativeCost.js";
 import { UnservedStations } from "../models/unservedStations.js";
+import { AnalyticsDashboard } from "../models/analyticsDashboard.js";
 import { runImport } from "../services/importData.js";
 import { authenticate, requireRole } from "../middleware/auth.js";
 
@@ -134,13 +135,24 @@ const buildStationPayload = (body) => {
 const buildTruckPayload = (body) => {
   const truckId = String(body.truck_id || "").trim();
   const station = String(body.station || "").trim();
+  const source = String(body.source || body.source_name || "").trim();
+  const sourceId = String(body.source_id || "").trim();
   const type = String(body.type || "").trim();
   const lat = parseNumber(body.lat);
   const lon = parseNumber(body.lon);
-  const stateRaw = String(body.state || "").trim();
-  const allowedStates = ["atStation", "maintenance", "travelling"];
+  const stateRaw = String(body.state || "").trim().toLowerCase();
+  const normalizedStateMap = {
+    atstation: "atStation",
+    atsource: "atSource",
+    atmaintenance: "atMaintenance",
+    maintenance: "atMaintenance",
+    travelling: "travelling",
+    traveling: "travelling"
+  };
+  const explicitState = normalizedStateMap[stateRaw] || null;
   const state =
-    allowedStates.includes(stateRaw) ? stateRaw : station ? "atStation" : "travelling";
+    explicitState ||
+    (station ? "atStation" : source ? "atSource" : "travelling");
   const errors = [];
 
   if (!truckId) errors.push("truck_id");
@@ -149,14 +161,20 @@ const buildTruckPayload = (body) => {
     if (!station) errors.push("station");
     if (lat === null || lon === null) errors.push("coordinates");
   }
+  if (state === "atSource") {
+    if (!source) errors.push("source");
+    if (lat === null || lon === null) errors.push("coordinates");
+  }
 
   return {
     payload: {
       truck_id: truckId,
       station: state === "atStation" ? station : null,
+      source: state === "atSource" ? source : null,
+      source_id: state === "atSource" ? sourceId || null : null,
       type,
-      lat,
-      lon,
+      lat: state === "atStation" || state === "atSource" ? lat : null,
+      lon: state === "atStation" || state === "atSource" ? lon : null,
       state
     },
     errors
@@ -200,14 +218,15 @@ const runRoutePlanner = (planId) =>
   });
 
 const fetchPlanBundle = async (planId) => {
-  const [delivery, truckPlanning, tentativeCost, unserved] = await Promise.all([
+  const [delivery, truckPlanning, tentativeCost, unserved, analytics] = await Promise.all([
     Delivery.findOne({ plan_id: planId }).lean(),
     TruckPlanning.findOne({ plan_id: planId }).lean(),
     TentativeCost.findOne({ plan_id: planId }).lean(),
-    UnservedStations.findOne({ plan_id: planId }).lean()
+    UnservedStations.findOne({ plan_id: planId }).lean(),
+    AnalyticsDashboard.findOne({ plan_id: planId }).lean()
   ]);
 
-  return { delivery, truckPlanning, tentativeCost, unserved };
+  return { delivery, truckPlanning, tentativeCost, unserved, analytics };
 };
 
 const normalizeDecision = (value) => {
@@ -499,6 +518,21 @@ router.get("/route-plan/:planId", async (req, res) => {
     return res.json({ plan_id: req.params.planId, ...bundle });
   } catch (error) {
     return res.status(500).json({ message: "Failed to load route plan.", error: error.message });
+  }
+});
+
+router.get("/analytics/latest", async (_req, res) => {
+  try {
+    const latest = await AnalyticsDashboard.findOne().sort({ created_at: -1 }).lean();
+    if (!latest) {
+      return res.status(404).json({ message: "No analytics snapshot found." });
+    }
+    return res.json(latest);
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to load analytics dashboard.",
+      error: error.message
+    });
   }
 });
 

@@ -8,6 +8,8 @@ import { connectDB } from "../db.js";
 import { Source } from "../models/source.js";
 import { Station } from "../models/station.js";
 import { Truck } from "../models/truck.js";
+import { SalesDaily } from "../models/salesDaily.js";
+import { SalesMonthly } from "../models/salesMonthly.js";
 import { seedStationManagers } from "./seedStationManagers.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
@@ -30,6 +32,7 @@ const resolveDataFile = (filename) => {
 const SOURCES_FILE = resolveDataFile("sources.xlsx");
 const STATIONS_FILE = resolveDataFile("clean_stationss.xlsx");
 const TRUCKS_FILE = resolveDataFile("truck_positions.json");
+const SALES_FILE = path.join(DATA_DIR, "sales_data.xlsx");
 
 const parseCoordinates = (value) => {
   if (!value || typeof value !== "string") {
@@ -60,6 +63,68 @@ const normalizeYesNo = (value) => {
     return normalized;
   }
   return "";
+};
+
+const normalizeName = (value) =>
+  String(value || "")
+    .replace(/[–—]/g, "-")
+    .replace(/\.\d+$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const toNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toMonthKey = (value) => {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  let date = null;
+  if (value instanceof Date) {
+    date = value;
+  } else if (typeof value === "number" && Number.isFinite(value)) {
+    const parsedExcelDate = xlsx.SSF.parse_date_code(value);
+    if (parsedExcelDate?.y && parsedExcelDate?.m) {
+      date = new Date(parsedExcelDate.y, parsedExcelDate.m - 1, parsedExcelDate.d || 1);
+    } else {
+      date = new Date(value);
+    }
+  } else {
+    const parsed = new Date(value);
+    date = Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  if (!date) {
+    return null;
+  }
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+};
+
+const toDateValue = (value) => {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsedExcelDate = xlsx.SSF.parse_date_code(value);
+    if (parsedExcelDate?.y && parsedExcelDate?.m) {
+      const date = new Date(parsedExcelDate.y, parsedExcelDate.m - 1, parsedExcelDate.d || 1);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 };
 
 const importSources = async () => {
@@ -119,7 +184,7 @@ const importStations = async () => {
     const capacity = Number(String(row["Capacity in Lt"] || "").trim());
     const deadStock = Number(String(row["Dead stock in Lt"] || "").trim());
     const usable = Number(String(row["Usable Lt"] || "").trim());
-    const sufficientFuel = normalizeYesNo(row["Now"] || row["Sufficient Fuel"]);
+    const sufficientFuelComputed = deadStock >= 0.6 * capacity ? "NO" : "YES";
 
     if (
       !station ||
@@ -141,7 +206,7 @@ const importStations = async () => {
             capacity_in_lt: capacity,
             dead_stock_in_lt: deadStock,
             usable_lt: usable,
-            sufficient_fuel: sufficientFuel || "NO"
+            sufficient_fuel: sufficientFuelComputed
           }
         },
         upsert: true
@@ -166,18 +231,60 @@ const importTrucks = async () => {
     return { matched: 0, modified: 0, upserted: 0 };
   }
 
+  const [sourceDocs, stationDocs] = await Promise.all([
+    Source.find({}, { source_id: 1, source_name: 1, coordinates: 1 }).lean(),
+    Station.find({}, { station: 1, coordinates: 1 }).lean()
+  ]);
+
+  const sourceByName = new Map(
+    sourceDocs.map((item) => [normalizeName(item.source_name), item])
+  );
+  const stationByName = new Map(
+    stationDocs.map((item) => [normalizeName(item.station), item])
+  );
+
   const raw = JSON.parse(fs.readFileSync(TRUCKS_FILE, "utf-8"));
   const operations = [];
 
   for (const [truckId, data] of Object.entries(raw || {})) {
-    const station = String(data?.station || "").trim();
-    const lat = Number(data?.lat);
-    const lon = Number(data?.lon);
     const type = String(data?.type || "").trim();
+    const stationCandidate = normalizeName(data?.station || data?.station_name || "");
+    const sourceCandidate = normalizeName(data?.source || data?.source_name || "");
+    const lat = toNumber(data?.lat);
+    const lon = toNumber(data?.lon);
 
-    if (!truckId || !station || Number.isNaN(lat) || Number.isNaN(lon) || !type) {
+    if (!truckId || !type) {
       continue;
     }
+
+    const sourceMatch =
+      sourceByName.get(sourceCandidate) ||
+      sourceByName.get(stationCandidate) ||
+      null;
+    const stationMatch = stationByName.get(stationCandidate) || null;
+
+    const isAtSource = Boolean(sourceMatch);
+    const isAtStation = !isAtSource && Boolean(stationMatch);
+    const state = isAtSource ? "atSource" : isAtStation ? "atStation" : "travelling";
+
+    const sourceName = isAtSource ? sourceMatch.source_name : null;
+    const sourceId = isAtSource ? sourceMatch.source_id : null;
+    const stationName = isAtStation ? stationMatch.station : null;
+
+    const coordLat =
+      lat ??
+      (isAtSource
+        ? sourceMatch.coordinates?.lat
+        : isAtStation
+          ? stationMatch.coordinates?.lat
+          : null);
+    const coordLon =
+      lon ??
+      (isAtSource
+        ? sourceMatch.coordinates?.lng ?? sourceMatch.coordinates?.lon
+        : isAtStation
+          ? stationMatch.coordinates?.lng ?? stationMatch.coordinates?.lon
+          : null);
 
     operations.push({
       updateOne: {
@@ -185,11 +292,13 @@ const importTrucks = async () => {
         update: {
           $set: {
             truck_id: truckId,
-            station,
-            lat,
-            lon,
+            station: stationName,
+            source: sourceName,
+            source_id: sourceId,
+            lat: coordLat,
+            lon: coordLon,
             type,
-            state: "atStation"
+            state
           }
         },
         upsert: true
@@ -209,16 +318,126 @@ const importTrucks = async () => {
   };
 };
 
+const importSalesMonthly = async () => {
+  if (!fs.existsSync(SALES_FILE)) {
+    return { matched: 0, modified: 0, upserted: 0 };
+  }
+
+  const rows = readSheetRows(SALES_FILE);
+  if (!rows.length) {
+    return { matched: 0, modified: 0, upserted: 0 };
+  }
+
+  const aggregate = new Map();
+  const dailyOperations = [];
+
+  for (const row of rows) {
+    const dateRaw = row.Date ?? row.date ?? row.Month ?? row.month;
+    const month = toMonthKey(dateRaw);
+    const dateValue = toDateValue(dateRaw);
+    if (!month) {
+      continue;
+    }
+
+    for (const [column, value] of Object.entries(row)) {
+      const columnLower = String(column).toLowerCase();
+      if (columnLower === "date" || columnLower === "month") {
+        continue;
+      }
+      const sales = toNumber(value);
+      if (sales === null) {
+        continue;
+      }
+
+      const stationName = normalizeName(column);
+      if (!stationName) {
+        continue;
+      }
+
+      if (dateValue) {
+        dailyOperations.push({
+          updateOne: {
+            filter: { date: dateValue, station_name: stationName },
+            update: {
+              $set: {
+                date: dateValue,
+                month,
+                station_name: stationName,
+                sales_lt: Number(sales.toFixed(2)),
+                source_file: "sales_data.xlsx"
+              }
+            },
+            upsert: true
+          }
+        });
+      }
+
+      const key = `${month}__${stationName}`;
+      const current = aggregate.get(key) || {
+        month,
+        station_name: stationName,
+        total_sales_lt: 0,
+        days_recorded: 0
+      };
+      current.total_sales_lt += sales;
+      current.days_recorded += 1;
+      aggregate.set(key, current);
+    }
+  }
+
+  const operations = [];
+  for (const item of aggregate.values()) {
+    const avgDaily =
+      item.days_recorded > 0 ? item.total_sales_lt / item.days_recorded : 0;
+
+    operations.push({
+      updateOne: {
+        filter: { month: item.month, station_name: item.station_name },
+        update: {
+          $set: {
+            month: item.month,
+            station_name: item.station_name,
+            total_sales_lt: Number(item.total_sales_lt.toFixed(2)),
+            avg_daily_sales_lt: Number(avgDaily.toFixed(2)),
+            days_recorded: item.days_recorded,
+            source_file: "sales_data.xlsx"
+          }
+        },
+        upsert: true
+      }
+    });
+  }
+
+  if (!operations.length) {
+    return { matched: 0, modified: 0, upserted: 0 };
+  }
+
+  await SalesDaily.deleteMany({ source_file: "sales_data.xlsx" });
+  if (dailyOperations.length) {
+    await SalesDaily.bulkWrite(dailyOperations);
+  }
+  await SalesMonthly.deleteMany({ source_file: "sales_data.xlsx" });
+  const result = await SalesMonthly.bulkWrite(operations);
+  return {
+    matched: result.matchedCount,
+    modified: result.modifiedCount,
+    upserted: result.upsertedCount,
+    daily_rows: dailyOperations.length
+  };
+};
+
 export const runImport = async () => {
   const sourceResult = await importSources();
   const stationResult = await importStations();
   const truckResult = await importTrucks();
+  const salesResult = await importSalesMonthly();
   await seedStationManagers();
 
   return {
     source: sourceResult,
     station: stationResult,
-    truck: truckResult
+    truck: truckResult,
+    sales_monthly: salesResult
   };
 };
 

@@ -1,1017 +1,1072 @@
+import hashlib
 import os
+import re
 import sys
 import uuid
-import re
-from datetime import datetime
-import math
+from collections import defaultdict
+from datetime import datetime, timezone
 
 import pandas as pd
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 
-import logic as lg
-
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or lg.GOOGLE_API_KEY
-lg.GOOGLE_API_KEY = GOOGLE_API_KEY
+import logic3 as l3
 
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME") or "operations_optimization"
 PLAN_ID = os.getenv("PLAN_ID") or str(uuid.uuid4())
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+USE_LIVE_ROUTES = str(os.getenv("USE_LIVE_ROUTES") or "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 if not MONGO_URI:
-    raise RuntimeError("MONGO_URI is required to run the route planner.")
+    raise RuntimeError("MONGO_URI is required.")
 
-CAPACITY_BY_TYPE = {ft["type"]: ft for ft in lg.FLEET}
-USE_GOOGLE = bool(GOOGLE_API_KEY)
-FAST_ROUTE = os.getenv("FAST_ROUTE", "1") != "0"
-
-# Time estimation constants (from logic2)
-AVG_SPEED_KMH = 40
-UNLOAD_MIN_PER_STOP = 30
-LOAD_MIN_AT_SOURCE = 45
-WORK_DAY_HOURS = 8
-WORK_DAY_MIN = WORK_DAY_HOURS * 60
+if GOOGLE_API_KEY:
+    l3.GOOGLE_API_KEY = GOOGLE_API_KEY
 
 
-def _coord_string(lat, lon):
-    return f"{lat},{lon}"
+if not USE_LIVE_ROUTES:
+    def _offline_get_road_info(olat, olon, dlat, dlon):
+        dist = round(l3.haversine(olat, olon, dlat, dlon) * 1.3, 1)
+        return dist, 0.0
 
 
-def _as_float(value):
+    l3.get_road_info = _offline_get_road_info
+
+
+def to_float(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError):
-        return None
+        return default
 
 
-def _parse_capacity_mt(truck_type):
-    if not truck_type:
-        return None
-    match = re.search(r"(\d+(?:\.\d+)?)", str(truck_type))
-    if not match:
-        return None
-    return _as_float(match.group(1))
+def normalize_name(value):
+    return str(value or "").replace("\u2013", "-").replace("\u2014", "-").strip().lower()
 
 
-def road_info(olat, olon, dlat, dlon):
-    if USE_GOOGLE:
-        return lg.get_road_info(olat, olon, dlat, dlon)
-    dist = lg.haversine(olat, olon, dlat, dlon) * 1.3
-    return dist, 0.0
+def parse_capacity_mt(value):
+    match = re.search(r"(\d+(?:\.\d+)?)", str(value or ""))
+    return to_float(match.group(1), None) if match else None
 
 
-def approx_road_info(olat, olon, dlat, dlon):
-    dist = lg.haversine(olat, olon, dlat, dlon) * 1.3
-    return dist, 0.0
+def get_truck_capacity_lt(doc):
+    # Canonical backend conversion: 1 MT = 1810 L.
+    # Prefer truck type / capacity_mt over stored capacity_lt to avoid stale values.
+    cap_mt = parse_capacity_mt(doc.get("type"))
+    if cap_mt is None:
+        cap_mt = to_float(doc.get("capacity_mt"), None)
+    if cap_mt is None:
+        cap_lt = to_float(doc.get("capacity_lt"), None)
+        if cap_lt is not None and cap_lt > 0:
+            return cap_lt
+        cap_mt = 7.0
+    return cap_mt * l3.MT_TO_LITERS
 
 
-def transport_cost_empty(dist_km):
-    return lg.calc_transport_cost(dist_km, 1.0)
-
-
-def build_journey(
-    truck,
-    start_pos_dict,
-    src_id,
-    src_name,
-    src_lat,
-    src_lon,
-    ordered_stops,
-    price_mt,
-):
-    cap_lt = truck["capacity_lt"]
-    steps = []
-
-    tot_purchase = 0.0
-    tot_transport = 0.0
-    tot_toll = 0.0
-    n_reloads = 0
-    cum = 0.0
-
-    total_lt = sum(s["needed_lt"] for s in ordered_stops)
-
-    steps.append(
-        {
-            "step_type": "INITIAL_PARK",
-            "label": "INITIAL PARK",
-            "location": start_pos_dict["station"],
-            "qty_lt": None,
-            "qty_mt": None,
-            "dist_km": None,
-            "toll": None,
-            "transport_cost": None,
-            "purchase_cost": None,
-            "leg_cost": None,
-            "cum_cost": None,
-            "tank_after_lt": None,
-            "note": "Truck starting position",
-        }
+def build_stations_df(stations):
+    return pd.DataFrame(
+        [{"Stations": s["station"], "Now": s["now"]} for s in stations]
     )
 
-    pk_dist, pk_toll = road_info(
-        start_pos_dict["lat"], start_pos_dict["lon"], src_lat, src_lon
-    )
 
-    remaining_stops = ordered_stops[:]
-    first_load_lt = 0.0
-    for stop in remaining_stops:
-        if first_load_lt + stop["needed_lt"] <= cap_lt:
-            first_load_lt += stop["needed_lt"]
-        else:
-            break
-    first_load_lt = min(first_load_lt, cap_lt)
-    first_load_mt = first_load_lt / lg.MT_TO_LITERS
-
-    pk_tc = transport_cost_empty(pk_dist)
-    first_purch = first_load_mt * price_mt
-    tot_purchase += first_purch
-    tot_transport += pk_tc
-    tot_toll += pk_toll
-    cum += pk_tc + pk_toll + first_purch
-
-    tank_lt = first_load_lt
-
-    steps.append(
-        {
-            "step_type": "LOAD",
-            "label": "SOURCE - LOAD",
-            "location": f"{src_name} ({src_id})",
-            "qty_lt": round(first_load_lt),
-            "qty_mt": round(first_load_mt, 3),
-            "dist_km": round(pk_dist, 1),
-            "toll": round(pk_toll, 2),
-            "transport_cost": round(pk_tc, 2),
-            "purchase_cost": round(first_purch, 2),
-            "leg_cost": round(pk_tc + pk_toll + first_purch, 2),
-            "cum_cost": round(cum, 2),
-            "tank_after_lt": round(first_load_lt),
-            "note": f"Loaded {first_load_lt:,.0f} Lt (capacity {cap_lt:,.0f} Lt)",
-        }
-    )
-
-    prev_lat, prev_lon = src_lat, src_lon
-    stop_seq = 0
-
-    for i, stop in enumerate(ordered_stops):
-        stop_seq += 1
-        s_lat = stop["station_lat"]
-        s_lon = stop["station_lon"]
-        s_name = stop["station"]
-        need = stop["needed_lt"]
-        need_mt = need / lg.MT_TO_LITERS
-
-        if tank_lt < need - 0.01:
-            n_reloads += 1
-
-            back_dist, back_toll = road_info(prev_lat, prev_lon, src_lat, src_lon)
-            remaining_needed = sum(s["needed_lt"] for s in ordered_stops[i:])
-            reload_lt = min(remaining_needed, cap_lt)
-            reload_mt = reload_lt / lg.MT_TO_LITERS
-
-            back_tc = lg.calc_transport_cost(back_dist, reload_mt)
-            reload_purchase = reload_mt * price_mt
-            tot_transport += back_tc
-            tot_toll += back_toll
-            tot_purchase += reload_purchase
-            cum += back_tc + back_toll + reload_purchase
-            tank_lt = reload_lt
-
-            steps.append(
-                {
-                    "step_type": "RELOAD",
-                    "label": f"RELOAD AT SOURCE (TRIP {n_reloads})",
-                    "location": f"{src_name} ({src_id})",
-                    "qty_lt": round(reload_lt),
-                    "qty_mt": round(reload_mt, 3),
-                    "dist_km": round(back_dist, 1),
-                    "toll": round(back_toll, 2),
-                    "transport_cost": round(back_tc, 2),
-                    "purchase_cost": round(reload_purchase, 2),
-                    "leg_cost": round(back_tc + back_toll + reload_purchase, 2),
-                    "cum_cost": round(cum, 2),
-                    "tank_after_lt": round(reload_lt),
-                    "note": (
-                        f"Back to source {back_dist:.1f} km, reload {reload_lt:,.0f} Lt"
-                    ),
-                }
-            )
-            prev_lat, prev_lon = src_lat, src_lon
-
-        del_dist, del_toll = road_info(prev_lat, prev_lon, s_lat, s_lon)
-
-        del_tc = lg.calc_transport_cost(del_dist, need_mt)
-        tot_transport += del_tc
-        tot_toll += del_toll
-        stop_purchase = need_mt * price_mt
-        leg_c = del_tc + del_toll
-        cum += leg_c + stop_purchase
-        tank_lt -= need
-
-        steps.append(
+def build_sources_df(sources):
+    return pd.DataFrame(
+        [
             {
-                "step_type": "DELIVER",
-                "label": f"STOP {stop_seq} - DELIVER",
-                "location": s_name,
-                "qty_lt": round(need),
-                "qty_mt": round(need_mt, 3),
-                "dist_km": round(del_dist, 1),
-                "toll": round(del_toll, 2),
-                "transport_cost": round(del_tc, 2),
-                "purchase_cost": round(stop_purchase, 2),
-                "leg_cost": round(leg_c + stop_purchase, 2),
-                "cum_cost": round(cum, 2),
-                "tank_after_lt": round(max(tank_lt, 0)),
-                "note": f"Delivered {need:,.0f} Lt",
+                "Source_ID": src["source_id"],
+                "Source_Name": src["source_name"],
+                "Price / MT Ex Terminal": src["price_mt"],
             }
+            for src in sources
+        ]
+    )
+
+
+def load_sales_context(db):
+    monthly_docs = list(
+        db["salesMonthly"].find(
+            {},
+            {
+                "_id": 0,
+                "month": 1,
+                "station_name": 1,
+                "total_sales_lt": 1,
+                "avg_daily_sales_lt": 1,
+                "days_recorded": 1,
+            },
+        )
+    )
+    if not monthly_docs:
+        monthly_docs = list(
+            db["monthlySales"].find(
+                {},
+                {
+                    "_id": 0,
+                    "month": 1,
+                    "station_name": 1,
+                    "total_sales_lt": 1,
+                    "avg_daily_sales_lt": 1,
+                    "days_recorded": 1,
+                },
+            )
         )
 
-        prev_lat, prev_lon = s_lat, s_lon
-
-    final_station = ordered_stops[-1]["station"]
-    steps.append(
-        {
-            "step_type": "FINAL_PARK",
-            "label": "FINAL PARK",
-            "location": final_station,
-            "qty_lt": None,
-            "qty_mt": None,
-            "dist_km": None,
-            "toll": None,
-            "transport_cost": None,
-            "purchase_cost": None,
-            "leg_cost": None,
-            "cum_cost": None,
-            "tank_after_lt": 0,
-            "note": "Truck parked here",
-        }
+    daily_docs = list(
+        db["salesDaily"].find(
+            {},
+            {
+                "_id": 0,
+                "date": 1,
+                "month": 1,
+                "station_name": 1,
+                "sales_lt": 1,
+            },
+        )
     )
 
-    cost_summary = {
-        "total_lt": round(total_lt),
-        "total_mt": round(total_lt / lg.MT_TO_LITERS, 3),
-        "tot_purchase": round(tot_purchase, 2),
-        "tot_transport": round(tot_transport, 2),
-        "tot_toll": round(tot_toll, 2),
-        "grand_total": round(tot_purchase + tot_transport + tot_toll, 2),
-        "n_reloads": n_reloads,
-        "pk_src_dist": round(pk_dist, 1),
-        "pk_src_toll": round(pk_toll, 2),
-        "first_load_lt": round(first_load_lt),
-    }
+    sales_df = pd.DataFrame(monthly_docs) if monthly_docs else pd.DataFrame()
+    if not sales_df.empty:
+        sales_df["station_name"] = sales_df["station_name"].astype(str).str.strip()
+        sales_df["month"] = sales_df["month"].astype(str).str.strip()
+        sales_df["total_sales_lt"] = pd.to_numeric(sales_df["total_sales_lt"], errors="coerce").fillna(0.0)
+        sales_df["avg_daily_sales_lt"] = pd.to_numeric(
+            sales_df["avg_daily_sales_lt"], errors="coerce"
+        ).fillna(0.0)
+        sales_df["days_recorded"] = pd.to_numeric(sales_df["days_recorded"], errors="coerce").fillna(0.0)
 
-    return steps, cost_summary
+    daily_df = pd.DataFrame(daily_docs) if daily_docs else pd.DataFrame()
+    if not daily_df.empty:
+        daily_df["station_name"] = daily_df["station_name"].astype(str).str.strip()
+        daily_df["date"] = pd.to_datetime(daily_df["date"], errors="coerce")
+        daily_df["sales_lt"] = pd.to_numeric(daily_df["sales_lt"], errors="coerce").fillna(0.0)
+        daily_df = daily_df.dropna(subset=["date"])
+        daily_df["month"] = daily_df["date"].dt.strftime("%Y-%m")
 
+    if sales_df.empty and daily_df.empty:
+        return {}, pd.DataFrame(), pd.DataFrame()
 
-def priority_score(capacity_lt, usable_lt):
-    max_cap = max(ft["capacity_lt"] for ft in lg.FLEET)
-    urgency = min(usable_lt / capacity_lt, 1.0) if capacity_lt > 0 else 0.5
-    volume = min(usable_lt / max_cap, 1.0)
-    return round((urgency * 0.6 + volume * 0.4) * 100, 1)
+    if sales_df.empty and not daily_df.empty:
+        monthly_agg = (
+            daily_df.groupby(["month", "station_name"], as_index=False)
+            .agg(total_sales_lt=("sales_lt", "sum"), days_recorded=("sales_lt", "count"))
+        )
+        monthly_agg["avg_daily_sales_lt"] = monthly_agg.apply(
+            lambda row: (row["total_sales_lt"] / row["days_recorded"]) if row["days_recorded"] else 0.0,
+            axis=1,
+        )
+        sales_df = monthly_agg
 
+    avg_sales = {}
+    if not daily_df.empty:
+        for station_name, group in daily_df.groupby("station_name"):
+            avg_sales[station_name] = float(group["sales_lt"].mean())
+    else:
+        for station_name, group in sales_df.groupby("station_name"):
+            avg_val = pd.to_numeric(group.get("avg_daily_sales_lt"), errors="coerce").mean()
+            if pd.isna(avg_val) or avg_val <= 0:
+                monthly = pd.to_numeric(group.get("total_sales_lt"), errors="coerce").mean()
+                days = pd.to_numeric(group.get("days_recorded"), errors="coerce").mean()
+                avg_val = (monthly / days) if days and not pd.isna(days) else 1000.0
+            avg_sales[station_name] = float(avg_val)
 
-def estimate_run_duration_min(journey_steps):
-    total_min = 0.0
-    for step in journey_steps:
-        stype = step.get("step_type", "")
-        dist = step.get("dist_km") or 0
-        if stype in ("LOAD", "RELOAD"):
-            total_min += (dist / AVG_SPEED_KMH) * 60 + LOAD_MIN_AT_SOURCE
-        elif stype == "DELIVER":
-            total_min += (dist / AVG_SPEED_KMH) * 60 + UNLOAD_MIN_PER_STOP
-    return round(total_min, 1)
+    if not daily_df.empty:
+        wide = daily_df.pivot_table(
+            index="date", columns="station_name", values="sales_lt", aggfunc="sum"
+        ).reset_index()
+        wide = wide.rename(columns={"date": "Date"})
+        wide["Date"] = pd.to_datetime(wide["Date"], errors="coerce")
+    else:
+        wide = sales_df.pivot_table(
+            index="month", columns="station_name", values="total_sales_lt", aggfunc="sum"
+        )
+        wide = wide.reset_index().rename(columns={"month": "Date"})
+        wide["Date"] = pd.to_datetime(wide["Date"].astype(str) + "-01", errors="coerce")
 
-
-def resolve_unserved(unserved_stations, delivery_plans, all_stations_df, sources_df):
-    resolutions = []
-
-    station_priority = {}
-    if all_stations_df is not None and not all_stations_df.empty:
-        for _, row in all_stations_df.iterrows():
-            name = str(row.get("Stations", "")).strip()
-            cap = float(row.get("Capacity in Lt", 0) or 0)
-            dead = float(row.get("Dead stock in Lt", 0) or 0)
-            if cap > 0 and dead > 0:
-                station_priority[name] = priority_score(cap, dead)
-
-    source_by_id = {}
-    if sources_df is not None and not sources_df.empty:
-        for _, s in sources_df.iterrows():
-            source_by_id[s["Source_ID"]] = s
-
-    max_truck_cap = max(ft["capacity_lt"] for ft in lg.FLEET)
-
-    remaining_unserved = list(unserved_stations)
-    groups = []
-    while remaining_unserved:
-        base = remaining_unserved.pop(0)
-        group = [base]
-        still = []
-        for s in remaining_unserved:
-            if (
-                lg.haversine(
-                    base["station_lat"],
-                    base["station_lon"],
-                    s["station_lat"],
-                    s["station_lon"],
-                )
-                <= lg.MAX_GROUPING_KM
-            ):
-                group.append(s)
-            else:
-                still.append(s)
-        remaining_unserved = still
-        groups.append(group)
-
-    trucks_assigned_today = set()
-
-    for group in groups:
-        group_lt = sum(s["needed_lt"] for s in group)
-        group_names = [s["station"] for s in group]
-
-        centroid_lat = sum(s["station_lat"] for s in group) / len(group)
-        centroid_lon = sum(s["station_lon"] for s in group) / len(group)
-
-        oversize_note = ""
-        if group_lt > max_truck_cap:
-            n_loads = int(math.ceil(group_lt / max_truck_cap))
-            oversize_note = (
-                f" Needs {group_lt:,.0f} Lt > max truck {max_truck_cap:,.0f} Lt. "
-                f"Requires {n_loads} loads or reload trips."
-            )
-
-        group_resolution = {
-            "grouped_with": group_names if len(group) > 1 else None,
-            "group_lt": round(group_lt),
-            "oversize": oversize_note,
-        }
-
-        best_truck = None
-        best_remain = -1
-        best_finish = None
-        best_time_needed = None
-
-        for dp in delivery_plans:
-            tid = dp["truck_id"]
-            if tid in trucks_assigned_today:
-                continue
-
-            est_dur = estimate_run_duration_min(dp.get("journey_steps", []))
-            remaining = WORK_DAY_MIN - est_dur
-            if remaining <= 0:
-                continue
-
-            truck_cap = dp.get("capacity_lt", max_truck_cap)
-            if truck_cap < min(s["needed_lt"] for s in group):
-                continue
-
-            if source_by_id:
-                all_dists = [
-                    (
-                        sid,
-                        lg.haversine(
-                            centroid_lat,
-                            centroid_lon,
-                            float(s["lat"]),
-                            float(s["lon"]),
-                        )
-                        * 1.3,
-                    )
-                    for sid, s in source_by_id.items()
-                ]
-                _, nearest_src_dist = min(all_dists, key=lambda x: x[1])
-            else:
-                nearest_src_dist = (
-                    lg.haversine(
-                        centroid_lat, centroid_lon, dp["source_lat"], dp["source_lon"]
-                    )
-                    * 1.3
-                )
-
-            park_lat = dp["final_lat"]
-            park_lon = dp["final_lon"]
-            park_to_centroid = (
-                lg.haversine(park_lat, park_lon, centroid_lat, centroid_lon) * 1.3
-            )
-            n_stops = len(group)
-            n_reloads_extra = max(0, int(math.ceil(group_lt / truck_cap)) - 1)
-            time_needed = (
-                (park_to_centroid / AVG_SPEED_KMH) * 60
-                + LOAD_MIN_AT_SOURCE
-                + (nearest_src_dist / AVG_SPEED_KMH) * 60
-                + n_stops * UNLOAD_MIN_PER_STOP
-                + n_stops * (15 / AVG_SPEED_KMH) * 60
-                + n_reloads_extra * LOAD_MIN_AT_SOURCE
-            )
-
-            if remaining >= time_needed and remaining > best_remain:
-                best_remain = remaining
-                best_truck = dp
-                best_finish = est_dur
-                best_time_needed = time_needed
-
-        if best_truck is None and delivery_plans:
-            best_truck = min(
-                delivery_plans,
-                key=lambda dp: lg.haversine(
-                    dp["final_lat"], dp["final_lon"], centroid_lat, centroid_lon
-                ),
-            )
-            best_finish = estimate_run_duration_min(best_truck.get("journey_steps", []))
-
-        best_swap = None
-        best_swap_detail = None
-        for u in group:
-            u_score = station_priority.get(u["station"], 50.0)
-            for dp in delivery_plans:
-                if dp.get("n_reloads", 0) > 0:
-                    continue
-                for stop in dp.get("stops", []):
-                    s_score = station_priority.get(stop["station"], 50.0)
-                    if s_score < u_score:
-                        truck_cap = dp.get("capacity_lt", max_truck_cap)
-                        if u["needed_lt"] <= truck_cap:
-                            best_swap_detail = {
-                                "truck_id": dp["truck_id"],
-                                "drop_station": stop["station"],
-                                "add_station": u["station"],
-                                "drop_score": round(s_score, 1),
-                                "add_score": round(u_score, 1),
-                            }
-                            best_swap = (
-                                f"Drop '{stop['station']}' (score {s_score:.0f}) "
-                                f"from {dp['truck_id']} to serve '{u['station']}' "
-                                f"(score {u_score:.0f}) instead."
-                            )
-                        break
-                if best_swap:
-                    break
-            if best_swap:
-                break
-
-        for u in group:
-            u_score = station_priority.get(u["station"], 50.0)
-
-            if best_truck and best_remain > 0:
-                trucks_assigned_today.add(best_truck["truck_id"])
-                group_note = (
-                    f" Grouped with: {[s['station'] for s in group if s is not u]}"
-                    if len(group) > 1
-                    else ""
-                )
-                action = "REASSIGN TODAY"
-                action_detail = (
-                    f"Truck {best_truck['truck_id']} finishes in ~{best_finish:.0f} min "
-                    f"and has {best_remain:.0f} min left. "
-                    f"Est extra run: {best_time_needed:.0f} min."
-                    f"{group_note}{oversize_note}"
-                )
-                when = "TODAY"
-                remaining_out = round(best_remain, 0)
-                time_out = round(best_time_needed, 0)
-
-            elif best_truck:
-                dist_km = round(
-                    lg.haversine(
-                        best_truck["final_lat"],
-                        best_truck["final_lon"],
-                        u["station_lat"],
-                        u["station_lon"],
-                    )
-                    * 1.3,
-                    1,
-                )
-                group_note = (
-                    f" Grouped with: {[s['station'] for s in group if s is not u]}"
-                    if len(group) > 1
-                    else ""
-                )
-                action = "SCHEDULE TOMORROW"
-                action_detail = (
-                    f"Truck {best_truck['truck_id']} parks {dist_km} km away. "
-                    f"First assignment tomorrow morning."
-                    f"{group_note}{oversize_note}"
-                )
-                when = "TOMORROW"
-                remaining_out = round(max(0, WORK_DAY_MIN - best_finish), 0)
-                time_out = None
-
-            else:
-                action = "MANUAL REVIEW"
-                action_detail = f"No trucks available. Review fleet manually.{oversize_note}"
-                when = "TBD"
-                remaining_out = None
-                time_out = None
-
-            resolutions.append(
-                {
-                    "resolution_id": str(uuid.uuid4()),
-                    "decision": "PENDING",
-                    "unserved_id": u.get("unserved_id"),
-                    "station": u["station"],
-                    "station_lat": u["station_lat"],
-                    "station_lon": u["station_lon"],
-                    "needed_lt": u["needed_lt"],
-                    "needed_mt": round(u["needed_mt"], 3),
-                    "reason": u.get("reason"),
-                    "priority_score": u_score,
-                    "action": action,
-                    "action_detail": action_detail,
-                    "truck_id": best_truck["truck_id"] if best_truck else None,
-                    "truck_type": best_truck.get("truck_type") if best_truck else None,
-                    "est_finish_min": round(best_finish, 0) if best_finish else None,
-                    "remaining_min": remaining_out,
-                    "time_needed_min": time_out,
-                    "when": when,
-                    "swap_candidate": best_swap,
-                    "swap_detail": best_swap_detail,
-                    "grouped_with": group_resolution["grouped_with"],
-                    "group_lt": group_resolution["group_lt"],
-                    "oversize": group_resolution["oversize"],
-                }
-            )
-
-    return resolutions
-
-
-def build_unserved_summary(resolutions):
-    summary = {
-        "total": len(resolutions),
-        "today": 0,
-        "tomorrow": 0,
-        "manual_review": 0,
-        "swap_suggestions": 0,
-        "pending": len(resolutions),
-        "accepted": 0,
-        "rejected": 0,
-    }
-    for r in resolutions:
-        when = r.get("when")
-        if when == "TODAY":
-            summary["today"] += 1
-        elif when == "TOMORROW":
-            summary["tomorrow"] += 1
-        else:
-            summary["manual_review"] += 1
-        if r.get("swap_candidate"):
-            summary["swap_suggestions"] += 1
-    return summary
+    return avg_sales, sales_df, wide
 
 
 def load_from_db(db):
-    sources_rows = []
-    for src in db["source"].find({}):
+    source_docs = list(db["source"].find({}))
+    station_docs = list(db["station"].find({}))
+
+    sources = []
+    source_by_name = {}
+    source_by_id = {}
+    for src in source_docs:
         coords = src.get("coordinates") or {}
-        lat = coords.get("lat")
-        lon = coords.get("lng") if coords.get("lng") is not None else coords.get("lon")
-        sources_rows.append(
-            {
-                "Source_ID": src.get("source_id"),
-                "Source_Name": src.get("source_name"),
-                "Coordinates": _coord_string(lat, lon),
-                "Price / MT Ex Terminal": src.get("price_per_mt_ex_terminal"),
-            }
-        )
+        lat = to_float(coords.get("lat"), None)
+        lon = to_float(coords.get("lng", coords.get("lon")), None)
+        if lat is None or lon is None:
+            continue
+        row = {
+            "source_id": str(src.get("source_id") or "").strip(),
+            "source_name": str(src.get("source_name") or "").strip(),
+            "source_lat": lat,
+            "source_lon": lon,
+            "price_mt": to_float(src.get("price_per_mt_ex_terminal"), 0.0),
+        }
+        if not row["source_id"]:
+            continue
+        sources.append(row)
+        source_by_name[normalize_name(row["source_name"])] = row
+        source_by_id[row["source_id"]] = row
 
-    stations_rows = []
-    for st in db["station"].find({}):
+    stations = []
+    station_by_name = {}
+    for st in station_docs:
         coords = st.get("coordinates") or {}
-        lat = coords.get("lat")
-        lon = coords.get("lng") if coords.get("lng") is not None else coords.get("lon")
-        stations_rows.append(
+        lat = to_float(coords.get("lat"), None)
+        lon = to_float(coords.get("lng", coords.get("lon")), None)
+        if lat is None or lon is None:
+            continue
+        station_name = str(st.get("station") or "").strip()
+        if not station_name:
+            continue
+        capacity_lt = to_float(st.get("capacity_in_lt"), 0.0)
+        dead_stock_lt = max(to_float(st.get("dead_stock_in_lt"), 0.0), 0.0)
+        stored_flag = str(st.get("sufficient_fuel") or "YES").strip().upper()
+        if capacity_lt > 0:
+            now_flag = "NO" if dead_stock_lt >= (0.6 * capacity_lt) else "YES"
+        else:
+            now_flag = "NO" if stored_flag == "NO" else "YES"
+        row = {
+            "station": station_name,
+            "station_lat": lat,
+            "station_lon": lon,
+            "capacity_lt": capacity_lt,
+            "dead_stock_lt": dead_stock_lt,
+            "needed_lt": dead_stock_lt,
+            "now": now_flag,
+        }
+        stations.append(row)
+        station_by_name[normalize_name(station_name)] = row
+
+    trucks = []
+    for truck in db["truck"].find({}).sort("truck_id", 1):
+        truck_id = str(truck.get("truck_id") or "").strip()
+        if not truck_id:
+            continue
+
+        state = str(truck.get("state") or "").strip()
+        if state not in ("atSource", "atStation", "atMaintenance", "travelling"):
+            if truck.get("source"):
+                state = "atSource"
+            elif truck.get("station"):
+                state = "atStation"
+            else:
+                state = "travelling"
+
+        source_name = str(truck.get("source") or "").strip()
+        source_id = str(truck.get("source_id") or "").strip()
+        station_name = str(truck.get("station") or "").strip()
+
+        source_match = None
+        if source_name:
+            source_match = source_by_name.get(normalize_name(source_name))
+        if not source_match and source_id:
+            source_match = source_by_id.get(source_id)
+        if source_match:
+            source_name = source_match["source_name"]
+            source_id = source_match["source_id"]
+
+        station_match = station_by_name.get(normalize_name(station_name)) if station_name else None
+
+        lat = to_float(truck.get("lat"), None)
+        lon = to_float(truck.get("lon"), None)
+        if (lat is None or lon is None) and source_match and state == "atSource":
+            lat, lon = source_match["source_lat"], source_match["source_lon"]
+        elif (lat is None or lon is None) and station_match and state == "atStation":
+            lat, lon = station_match["station_lat"], station_match["station_lon"]
+        if lat is None or lon is None:
+            lat, lon = 0.0, 0.0
+
+        if state == "atSource":
+            parked_label = source_name or (source_match["source_name"] if source_match else None)
+        elif state == "atStation":
+            parked_label = station_name or (station_match["station"] if station_match else None)
+        elif state == "atMaintenance":
+            parked_label = str(truck.get("maintenance_station") or station_name or "Maintenance").strip() or "Maintenance"
+        else:
+            parked_label = station_name or source_name or "Travelling"
+
+        trucks.append(
             {
-                "Stations": st.get("station"),
-                "Coordinates": _coord_string(lat, lon),
-                "Capacity in Lt": st.get("capacity_in_lt"),
-                "Dead stock in Lt": st.get("dead_stock_in_lt"),
-                "Usable Lt": st.get("usable_lt"),
-                "Now": st.get("sufficient_fuel", "NO"),
+                "truck_id": truck_id,
+                "type": str(truck.get("type") or "").strip() or "7MT",
+                "capacity_lt": get_truck_capacity_lt(truck),
+                "capacity_mt": round(get_truck_capacity_lt(truck) / l3.MT_TO_LITERS, 3),
+                "state": state,
+                "parked_station": station_name or None,
+                "parked_source": source_name or None,
+                "parked_source_id": source_id or None,
+                "parked_label": parked_label,
+                "parked_lat": lat,
+                "parked_lon": lon,
             }
         )
 
-    sources = pd.DataFrame(sources_rows)
-    stations = pd.DataFrame(stations_rows)
-
-    if sources.empty or stations.empty:
-        return stations, sources
-
-    sources["Source_ID"] = sources["Source_ID"].astype(str).str.strip()
-    sources["Source_Name"] = sources["Source_Name"].astype(str).str.strip()
-    stations["Stations"] = stations["Stations"].astype(str).str.strip()
-
-    stations["lat"], stations["lon"] = zip(
-        *stations["Coordinates"].map(lg.parse_coords)
-    )
-    sources["lat"], sources["lon"] = zip(
-        *sources["Coordinates"].map(lg.parse_coords)
-    )
-
-    return stations, sources
+    return stations, sources, trucks
 
 
-def build_fleet_from_db(stations, db):
-    trucks_docs = list(db["truck"].find({}).sort("truck_id", 1))
-    trucks = []
+def allocate_delivery_quantities(stops, truck_capacity_lt, avg_sales):
+    total_needed = sum(float(stop.get("needed_lt") or 0.0) for stop in stops)
+    capacity = max(float(truck_capacity_lt or 0.0), 0.0)
+    if not stops or capacity <= 0:
+        for stop in stops:
+            stop["deliver_lt"] = 0
+            stop["deliver_mt"] = 0.0
+        return False
 
-    if trucks_docs:
-        for doc in trucks_docs:
-            truck_type = str(doc.get("type") or "").strip()
-            caps = CAPACITY_BY_TYPE.get(truck_type, {})
-            capacity_mt = _as_float(doc.get("capacity_mt"))
-            capacity_lt = _as_float(doc.get("capacity_lt"))
-            if capacity_mt is None:
-                capacity_mt = caps.get("capacity_mt")
-            if capacity_lt is None:
-                capacity_lt = caps.get("capacity_lt")
-            if capacity_mt is None:
-                parsed = _parse_capacity_mt(truck_type)
-                if parsed is not None:
-                    capacity_mt = parsed
-                    capacity_lt = parsed * lg.MT_TO_LITERS
-            if capacity_mt is None:
-                capacity_mt = 0
-            if capacity_lt is None:
-                capacity_lt = 0
-            trucks.append(
-                {
-                    "truck_id": str(doc.get("truck_id")),
-                    "type": truck_type,
-                    "capacity_mt": capacity_mt,
-                    "capacity_lt": capacity_lt,
-                    "parked_station": doc.get("station"),
-                    "parked_lat": float(doc.get("lat")),
-                    "parked_lon": float(doc.get("lon")),
-                }
+    if total_needed <= capacity:
+        for stop in stops:
+            deliver = round(float(stop.get("needed_lt") or 0.0))
+            stop["deliver_lt"] = max(deliver, 0)
+            stop["deliver_mt"] = round(stop["deliver_lt"] / l3.MT_TO_LITERS, 3)
+        return False
+
+    if len(stops) == 1:
+        deliver = min(round(float(stops[0].get("needed_lt") or 0.0)), round(capacity))
+        stops[0]["deliver_lt"] = max(deliver, 0)
+        stops[0]["deliver_mt"] = round(stops[0]["deliver_lt"] / l3.MT_TO_LITERS, 3)
+        return False
+
+    # Split should be used only when combined demand exceeds truck capacity.
+    l3.compute_delivery_quantities(stops, capacity, avg_sales)
+
+    for stop in stops:
+        needed = max(round(float(stop.get("needed_lt") or 0.0)), 0)
+        proposed = max(round(float(stop.get("deliver_lt") or 0.0)), 0)
+        stop["deliver_lt"] = min(proposed, needed)
+
+    delivered = sum(stop["deliver_lt"] for stop in stops)
+    capacity_left = max(round(capacity) - delivered, 0)
+    sales_weights = [
+        max(float(l3.get_sales_avg(avg_sales, stop.get("station") or "")), 0.0)
+        for stop in stops
+    ]
+
+    while capacity_left > 0:
+        unmet = [
+            (
+                idx,
+                max(round(float(stop.get("needed_lt") or 0.0)) - int(stop.get("deliver_lt") or 0), 0),
             )
-        return trucks
+            for idx, stop in enumerate(stops)
+        ]
+        unmet = [item for item in unmet if item[1] > 0]
+        if not unmet:
+            break
+        idx, need_left = max(
+            unmet,
+            key=lambda item: (
+                sales_weights[item[0]],
+                item[1],
+            ),
+        )
+        add = min(capacity_left, need_left)
+        stops[idx]["deliver_lt"] += add
+        capacity_left -= add
 
-    # Fallback: use the configured fleet and spread across stations
-    num = 1
-    for ft in lg.FLEET:
-        for _ in range(ft["count"]):
-            trucks.append(
-                {
-                    "truck_id": f"T{num:02d}",
-                    "type": ft["type"],
-                    "capacity_mt": ft["capacity_mt"],
-                    "capacity_lt": ft["capacity_lt"],
-                    "parked_station": None,
-                    "parked_lat": None,
-                    "parked_lon": None,
-                }
-            )
-            num += 1
+    for stop in stops:
+        stop["deliver_mt"] = round(float(stop["deliver_lt"]) / l3.MT_TO_LITERS, 3)
 
-    if not stations.empty:
-        indices = lg.dispersion_indices(stations, len(trucks))
-        for t, idx in zip(trucks, indices):
-            row = stations.iloc[idx]
-            t["parked_station"] = row["Stations"]
-            t["parked_lat"] = float(row["lat"])
-            t["parked_lon"] = float(row["lon"])
-
-    return trucks
+    return True
 
 
-def build_plan(stations, sources, trucks):
-    if stations.empty or sources.empty:
-        return [], [], trucks, {}, [], []
-
-    needing = stations[stations["Now"].str.strip().str.upper() == "NO"].copy()
-    if needing.empty:
-        return [], [], trucks, {}, [], []
-
+def assign_cheapest_source(stations, sources):
     station_data = []
-    for _, srow in needing.iterrows():
-        slat, slon = float(srow["lat"]), float(srow["lon"])
-        sname = srow["Stations"]
-        needed_lt = _as_float(srow.get("Dead stock in Lt"))
-        if needed_lt is None or needed_lt <= 0:
-            continue
-        needed_mt = needed_lt / lg.MT_TO_LITERS
-
-        best_src, best_total = None, float("inf")
-        best_dist = best_toll = best_tc = best_pc = None
-
-        for _, src in sources.iterrows():
-            if FAST_ROUTE:
-                dist_km, toll = approx_road_info(
-                    float(src["lat"]), float(src["lon"]), slat, slon
-                )
-            else:
-                dist_km, toll = road_info(
-                    float(src["lat"]), float(src["lon"]), slat, slon
-                )
-            tc = lg.calc_transport_cost(dist_km, needed_mt)
-            pc = float(src["Price / MT Ex Terminal"]) * needed_mt
-            tot = pc + tc + toll
-            if tot < best_total:
-                best_total = tot
-                best_src = src.copy()
-                best_dist, best_toll, best_tc, best_pc = dist_km, toll, tc, pc
-
-        if best_src is None:
+    for station in stations:
+        needed_mt = station["needed_lt"] / l3.MT_TO_LITERS if station["needed_lt"] else 0.0
+        if needed_mt <= 0:
             continue
 
-        if FAST_ROUTE:
-            dist_km, toll = road_info(
-                float(best_src["lat"]), float(best_src["lon"]), slat, slon
+        best = None
+        best_total = float("inf")
+        for src in sources:
+            dist_km, toll = l3.get_road_info(
+                src["source_lat"], src["source_lon"], station["station_lat"], station["station_lon"]
             )
-            tc = lg.calc_transport_cost(dist_km, needed_mt)
-            pc = float(best_src["Price / MT Ex Terminal"]) * needed_mt
-            best_dist, best_toll, best_tc, best_pc = dist_km, toll, tc, pc
-            best_total = pc + tc + toll
+            transport = l3.transport_cost_calc(dist_km, needed_mt)
+            purchase = src["price_mt"] * needed_mt
+            total = transport + purchase + toll
+            if total < best_total:
+                best_total = total
+                best = (src, dist_km, toll)
+
+        if not best:
+            continue
+
+        src, src_dist, src_toll = best
         station_data.append(
             {
-                "station": sname,
-                "station_lat": slat,
-                "station_lon": slon,
-                "needed_lt": needed_lt,
-                "needed_mt": needed_mt,
-                "source_id": best_src["Source_ID"],
-                "source_name": best_src["Source_Name"],
-                "source_lat": float(best_src["lat"]),
-                "source_lon": float(best_src["lon"]),
-                "price_mt": float(best_src["Price / MT Ex Terminal"]),
-                "dist_km": best_dist,
-                "toll_cost": best_toll,
-                "transport_cost": best_tc,
-                "purchase_cost": best_pc,
-                "total_cost": best_total,
+                "station": station["station"],
+                "station_lat": station["station_lat"],
+                "station_lon": station["station_lon"],
+                "needed_lt": station["needed_lt"],
+                "needed_mt": round(station["needed_lt"] / l3.MT_TO_LITERS, 3),
+                "source_id": src["source_id"],
+                "source_name": src["source_name"],
+                "source_lat": src["source_lat"],
+                "source_lon": src["source_lon"],
+                "price_mt": src["price_mt"],
+                "source_station_dist_km": src_dist,
+                "source_station_toll": src_toll,
             }
         )
 
-    # Start positions snapshot
-    start_positions = {
+    return station_data
+
+
+def build_plan(stations, sources, trucks, avg_sales):
+    needing = [s for s in stations if s["now"] == "NO" and s["needed_lt"] > 0]
+    if not needing:
+        return [], [], trucks, []
+
+    station_data = assign_cheapest_source(needing, sources)
+
+    by_source = defaultdict(list)
+    for row in station_data:
+        by_source[row["source_id"]].append(row)
+
+    start_pos = {
         t["truck_id"]: {
-            "station": t["parked_station"],
+            "station": t["parked_label"],
             "lat": t["parked_lat"],
             "lon": t["parked_lon"],
         }
         for t in trucks
     }
 
-    delivery_plans = []
-    unserved_stations = []
     truck_available = {t["truck_id"]: True for t in trucks}
     truck_by_id = {t["truck_id"]: t for t in trucks}
+    delivery_plans = []
+    unserved = []
 
-    by_source = {}
-    for sd in station_data:
-        by_source.setdefault(sd["source_id"], []).append(sd)
+    for src_id, source_rows in by_source.items():
+        src_lat = source_rows[0]["source_lat"]
+        src_lon = source_rows[0]["source_lon"]
+        src_name = source_rows[0]["source_name"]
+        price_mt = source_rows[0]["price_mt"]
 
-    for src_id, sds in by_source.items():
-        src_lat = sds[0]["source_lat"]
-        src_lon = sds[0]["source_lon"]
-
-        for sd in sds:
-            sd["_d_src"] = lg.haversine(
-                src_lat, src_lon, sd["station_lat"], sd["station_lon"]
-            )
-        sds.sort(key=lambda x: x["_d_src"])
-
-        runs = lg.balanced_partition(sds, lg.MAX_STOPS_PER_TRUCK, lg.MAX_GROUPING_KM)
+        for row in source_rows:
+            row["_d_src"] = l3.haversine(src_lat, src_lon, row["station_lat"], row["station_lon"])
+        source_rows.sort(key=lambda item: item["_d_src"])
+        runs = l3.balanced_partition(source_rows, l3.MAX_STOPS_PER_TRUCK, l3.MAX_GROUPING_KM)
 
         for run in runs:
-            total_needed_lt = sum(r["needed_lt"] for r in run)
+            for stop in run:
+                stop["deliver_lt"] = stop["needed_lt"]
+                stop["deliver_mt"] = round(stop["needed_lt"] / l3.MT_TO_LITERS, 3)
+                stop["avg_sales"] = round(float(l3.get_sales_avg(avg_sales, stop["station"])), 2)
 
-            cands_all = [
+            candidates_all = [
                 (
-                    lg.haversine(
-                        t["parked_lat"], t["parked_lon"], src_lat, src_lon
-                    ),
+                    l3.haversine(t["parked_lat"], t["parked_lon"], src_lat, src_lon),
                     t,
                 )
                 for t in trucks
                 if truck_available[t["truck_id"]]
             ]
-            if not cands_all:
-                for s in run:
-                    unserved_stations.append(
+            if not candidates_all:
+                for stop in run:
+                    needed = round(stop["needed_lt"])
+                    unserved.append(
                         {
                             "unserved_id": str(uuid.uuid4()),
+                            "station": stop["station"],
+                            "needed_lt": needed,
+                            "needed_mt": round(needed / l3.MT_TO_LITERS, 3),
+                            "station_lat": stop["station_lat"],
+                            "station_lon": stop["station_lon"],
+                            "source_id": stop["source_id"],
+                            "source_name": stop["source_name"],
+                            "reason": "No truck available",
                             "status": "UNSERVED",
-                            "station": s["station"],
-                            "station_lat": s["station_lat"],
-                            "station_lon": s["station_lon"],
-                            "needed_lt": s["needed_lt"],
-                            "needed_mt": s["needed_mt"],
-                            "source_id": s["source_id"],
-                            "source_name": s["source_name"],
-                            "reason": "Could not be delivered due to shortage of trucks",
                         }
                     )
                 continue
 
+            total_need_lt = sum(stop["needed_lt"] for stop in run)
             fitting = sorted(
-                [
-                    (d, t)
-                    for d, t in cands_all
-                    if t["capacity_lt"] >= total_needed_lt
-                ],
-                key=lambda x: x[0],
+                [(d, t) for d, t in candidates_all if t["capacity_lt"] >= total_need_lt],
+                key=lambda item: item[0],
             )
-            cands = fitting if fitting else sorted(cands_all, key=lambda x: x[0])
-            _, chosen = cands[0]
+            if fitting:
+                _, chosen = fitting[0]
+            else:
+                # If no truck can fully satisfy combined demand, prefer the largest
+                # available capacity first (maximise delivered litres), then nearest.
+                best = sorted(
+                    candidates_all,
+                    key=lambda item: (-float(item[1].get("capacity_lt") or 0.0), item[0]),
+                )
+                _, chosen = best[0]
             truck_available[chosen["truck_id"]] = False
 
-            price_mt = run[0]["price_mt"]
-            stops_detail = []
-            for stop in run:
-                stops_detail.append(
-                    {
-                        "station": stop["station"],
-                        "needed_lt": round(stop["needed_lt"]),
-                        "needed_mt": round(stop["needed_mt"], 3),
-                        "station_lat": stop["station_lat"],
-                        "station_lon": stop["station_lon"],
-                    }
-                )
-
-            journey_steps, costs = build_journey(
+            split_used = allocate_delivery_quantities(run, chosen["capacity_lt"], avg_sales)
+            journey_steps, costs = l3.build_journey(
                 chosen,
-                start_positions[chosen["truck_id"]],
+                start_pos[chosen["truck_id"]],
                 src_id,
-                run[0]["source_name"],
+                src_name,
                 src_lat,
                 src_lon,
                 run,
                 price_mt,
             )
 
-            final_park = stops_detail[-1]["station"]
-            final_lat = stops_detail[-1]["station_lat"]
-            final_lon = stops_detail[-1]["station_lon"]
+            stops_payload = []
+            for stop in run:
+                needed_lt = round(float(stop["needed_lt"]))
+                deliver_lt = round(float(stop["deliver_lt"]))
+                needed_mt = round(needed_lt / l3.MT_TO_LITERS, 3)
+                deliver_mt = round(deliver_lt / l3.MT_TO_LITERS, 3)
+                shortfall_lt = max(0, needed_lt - deliver_lt)
+                if shortfall_lt > 0:
+                    unserved.append(
+                        {
+                            "unserved_id": str(uuid.uuid4()),
+                            "station": stop["station"],
+                            "needed_lt": shortfall_lt,
+                            "needed_mt": round(shortfall_lt / l3.MT_TO_LITERS, 3),
+                            "station_lat": stop["station_lat"],
+                            "station_lon": stop["station_lon"],
+                            "source_id": src_id,
+                            "source_name": src_name,
+                            "reason": "Truck capacity lower than combined demand",
+                            "status": "UNSERVED",
+                        }
+                    )
+
+                stops_payload.append(
+                    {
+                        "station": stop["station"],
+                        "needed_lt": needed_lt,
+                        "needed_mt": needed_mt,
+                        "deliver_lt": deliver_lt,
+                        "deliver_mt": deliver_mt,
+                        "split_pct": 0.0,
+                        "avg_sales": stop.get("avg_sales"),
+                        "station_lat": stop["station_lat"],
+                        "station_lon": stop["station_lon"],
+                    }
+                )
+
+            total_load_lt = round(costs["total_deliver_lt"])
+            total_load_mt = round(total_load_lt / l3.MT_TO_LITERS, 3)
+            if total_load_lt > 0:
+                for stop in stops_payload:
+                    stop["split_pct"] = round((float(stop["deliver_lt"]) / total_load_lt) * 100, 1)
+            else:
+                for stop in stops_payload:
+                    stop["split_pct"] = 0.0
+
+            split_by_station = {stop["station"]: stop["split_pct"] for stop in stops_payload}
+            for step in journey_steps:
+                if step.get("step_type") == "DELIVER":
+                    step["split_pct"] = split_by_station.get(step.get("location"), 0.0)
 
             delivery_plans.append(
                 {
                     "truck_id": chosen["truck_id"],
                     "truck_type": chosen["type"],
-                    "capacity_lt": chosen["capacity_lt"],
-                    "initial_park": start_positions[chosen["truck_id"]]["station"],
-                    "initial_park_lat": start_positions[chosen["truck_id"]]["lat"],
-                    "initial_park_lon": start_positions[chosen["truck_id"]]["lon"],
+                    "capacity_lt": round(chosen["capacity_lt"]),
+                    "capacity_mt": round(chosen["capacity_lt"] / l3.MT_TO_LITERS, 3),
+                    "initial_park": start_pos[chosen["truck_id"]]["station"],
+                    "initial_park_lat": start_pos[chosen["truck_id"]]["lat"],
+                    "initial_park_lon": start_pos[chosen["truck_id"]]["lon"],
                     "source_id": src_id,
-                    "source_name": run[0]["source_name"],
+                    "source_name": src_name,
                     "source_lat": src_lat,
                     "source_lon": src_lon,
                     "pk_src_dist": costs["pk_src_dist"],
                     "pk_src_toll": costs["pk_src_toll"],
-                    "tk_src_dist": costs["pk_src_dist"],
-                    "tk_src_toll": costs["pk_src_toll"],
-                    "first_load_lt": costs["first_load_lt"],
-                    "stops": stops_detail,
+                    "total_lt": total_load_lt,
+                    "total_mt": total_load_mt,
+                    "total_load_lt": total_load_lt,
+                    "total_load_mt": total_load_mt,
+                    "stops": stops_payload,
                     "journey_steps": journey_steps,
-                    "final_park": final_park,
-                    "final_lat": final_lat,
-                    "final_lon": final_lon,
-                    "total_lt": costs["total_lt"],
-                    "total_mt": costs["total_mt"],
-                    "tot_purchase": costs["tot_purchase"],
-                    "tot_transport": costs["tot_transport"],
-                    "tot_toll": costs["tot_toll"],
-                    "grand_total": costs["grand_total"],
-                    "n_reloads": costs["n_reloads"],
+                    "last_delivery_stop": stops_payload[-1]["station"] if stops_payload else None,
+                    "final_park": src_name,
+                    "final_lat": src_lat,
+                    "final_lon": src_lon,
+                    "tot_purchase": round(costs["tot_purchase"], 2),
+                    "tot_transport": round(costs["tot_transport"], 2),
+                    "tot_toll": round(costs["tot_toll"], 2),
+                    "grand_total": round(costs["grand_total"], 2),
+                    "n_reloads": 0,
+                    "split_used": split_used,
                 }
             )
 
-            truck_by_id[chosen["truck_id"]]["parked_station"] = final_park
-            truck_by_id[chosen["truck_id"]]["parked_lat"] = final_lat
-            truck_by_id[chosen["truck_id"]]["parked_lon"] = final_lon
+            truck_by_id[chosen["truck_id"]]["parked_station"] = None
+            truck_by_id[chosen["truck_id"]]["parked_source"] = src_name
+            truck_by_id[chosen["truck_id"]]["parked_source_id"] = src_id
+            truck_by_id[chosen["truck_id"]]["parked_label"] = src_name
+            truck_by_id[chosen["truck_id"]]["parked_lat"] = src_lat
+            truck_by_id[chosen["truck_id"]]["parked_lon"] = src_lon
+            truck_by_id[chosen["truck_id"]]["state"] = "atSource"
 
-    used_ids = {dp["truck_id"] for dp in delivery_plans}
+    used_ids = {plan["truck_id"] for plan in delivery_plans}
     fleet_status = []
-    for t in trucks:
+    for truck in trucks:
         fleet_status.append(
             {
-                "truck_id": t["truck_id"],
-                "type": t["type"],
-                "status": "DEPLOYED" if t["truck_id"] in used_ids else "STANDBY",
-                "initial_park": start_positions[t["truck_id"]]["station"],
-                "final_park": truck_by_id[t["truck_id"]]["parked_station"],
+                "truck_id": truck["truck_id"],
+                "type": truck["type"],
+                "status": "DEPLOYED" if truck["truck_id"] in used_ids else "STANDBY",
+                "initial_park": start_pos[truck["truck_id"]]["station"],
+                "final_park": truck.get("parked_label"),
             }
         )
 
-    unserved_resolutions = resolve_unserved(
-        unserved_stations, delivery_plans, stations, sources
-    )
-
-    return (
-        delivery_plans,
-        fleet_status,
-        trucks,
-        start_positions,
-        unserved_stations,
-        unserved_resolutions,
-    )
+    return delivery_plans, fleet_status, trucks, unserved
 
 
 def build_cost_summary(delivery_plans):
-    cost_summary = []
     totals = {"purchase": 0.0, "transport": 0.0, "toll": 0.0, "grand_total": 0.0}
+    rows = []
+    for plan in delivery_plans:
+        row = {
+            "truck_id": plan["truck_id"],
+            "source_id": plan["source_id"],
+            "stations": [stop["station"] for stop in plan.get("stops", [])],
+            "tot_purchase": round(plan.get("tot_purchase", 0.0), 2),
+            "tot_transport": round(plan.get("tot_transport", 0.0), 2),
+            "tot_toll": round(plan.get("tot_toll", 0.0), 2),
+            "grand_total": round(plan.get("grand_total", 0.0), 2),
+        }
+        rows.append(row)
+        totals["purchase"] += row["tot_purchase"]
+        totals["transport"] += row["tot_transport"]
+        totals["toll"] += row["tot_toll"]
+        totals["grand_total"] += row["grand_total"]
 
-    for dp in delivery_plans:
-        stations = [s["station"] for s in dp["stops"]]
-        cost_summary.append(
+    totals = {k: round(v, 2) for k, v in totals.items()}
+    return rows, totals
+
+
+def build_source_comparison(sources_df, delivery_plans):
+    source_rows = []
+    if sources_df is not None and not sources_df.empty:
+        source_rows = sources_df.to_dict("records")
+
+    usage = defaultdict(
+        lambda: {
+            "runs": 0,
+            "total_lt": 0.0,
+            "total_cost": 0.0,
+            "total_purchase": 0.0,
+        }
+    )
+    for plan in delivery_plans:
+        sid = plan.get("source_id")
+        if not sid:
+            continue
+        usage[sid]["runs"] += 1
+        usage[sid]["total_lt"] += float(plan.get("total_load_lt") or plan.get("total_lt") or 0.0)
+        usage[sid]["total_cost"] += float(plan.get("grand_total") or 0.0)
+        usage[sid]["total_purchase"] += float(plan.get("tot_purchase") or 0.0)
+
+    if not source_rows:
+        out = []
+        for sid, row in usage.items():
+            mt = row["total_lt"] / l3.MT_TO_LITERS if row["total_lt"] else 0.0
+            out.append(
+                {
+                    "source_id": sid,
+                    "source_name": sid,
+                    "rank": None,
+                    "price_per_mt": None,
+                    "vs_cheapest_per_mt": None,
+                    "recommendation": "",
+                    "runs": row["runs"],
+                    "total_lt": round(row["total_lt"], 0),
+                    "total_mt": round(mt, 3),
+                    "avg_cost_per_mt": round(row["total_cost"] / mt, 2) if mt else 0.0,
+                    "total_purchase": round(row["total_purchase"], 2),
+                }
+            )
+        out.sort(key=lambda item: item["avg_cost_per_mt"])
+        return out
+
+    df = pd.DataFrame(source_rows).copy()
+    df["Source_ID"] = df["Source_ID"].astype(str)
+    df["Source_Name"] = df["Source_Name"].astype(str)
+    df["Price / MT Ex Terminal"] = pd.to_numeric(
+        df["Price / MT Ex Terminal"], errors="coerce"
+    ).fillna(0.0)
+    df = df.sort_values("Price / MT Ex Terminal", ascending=True).reset_index(drop=True)
+    cheapest = float(df["Price / MT Ex Terminal"].iloc[0]) if not df.empty else 0.0
+
+    out = []
+    for idx, row in df.iterrows():
+        sid = str(row["Source_ID"])
+        sname = str(row["Source_Name"])
+        price = float(row["Price / MT Ex Terminal"])
+        vs_cheapest = price - cheapest
+        row_usage = usage[sid]
+        mt = row_usage["total_lt"] / l3.MT_TO_LITERS if row_usage["total_lt"] else 0.0
+        if idx == 0:
+            rec = "Cheapest terminal - preferred"
+        elif idx <= 2:
+            rec = "Competitive option"
+        else:
+            rec = f"Costlier by Rs {vs_cheapest:,.0f}/MT"
+        out.append(
             {
-                "truck_id": dp["truck_id"],
-                "source_id": dp["source_id"],
-                "stations": stations,
-                "tot_purchase": dp["tot_purchase"],
-                "tot_transport": dp["tot_transport"],
-                "tot_toll": dp["tot_toll"],
-                "grand_total": dp["grand_total"],
+                "source_id": sid,
+                "source_name": sname,
+                "rank": int(idx + 1),
+                "price_per_mt": round(price, 2),
+                "vs_cheapest_per_mt": round(vs_cheapest, 2),
+                "recommendation": rec,
+                "runs": int(row_usage["runs"]),
+                "total_lt": round(row_usage["total_lt"], 0),
+                "total_mt": round(mt, 3),
+                "avg_cost_per_mt": round(row_usage["total_cost"] / mt, 2) if mt else 0.0,
+                "total_purchase": round(row_usage["total_purchase"], 2),
             }
         )
-        totals["purchase"] += dp["tot_purchase"]
-        totals["transport"] += dp["tot_transport"]
-        totals["toll"] += dp["tot_toll"]
-        totals["grand_total"] += dp["grand_total"]
-
-    for key in totals:
-        totals[key] = round(totals[key], 2)
-
-    return cost_summary, totals
+    return out
 
 
-def write_plan(
-    db, delivery_plans, fleet_status, trucks, start_positions, unserved, resolutions
-):
+def build_station_intelligence(sales_df, sales_raw):
+    if sales_df.empty and sales_raw.empty:
+        return {
+            "top_stations": [],
+            "volatile_stations": [],
+            "monthly_summary": [],
+            "all_stations": [],
+        }
+
+    monthly_summary = []
+    if not sales_df.empty:
+        monthly_summary = (
+            sales_df.groupby("month", as_index=False)["total_sales_lt"]
+            .sum()
+            .sort_values("month")
+            .to_dict("records")
+        )
+    latest_month = monthly_summary[-1]["month"] if monthly_summary else ""
+
+    station_stats = []
+    if not sales_raw.empty:
+        df = sales_raw.copy()
+        if "Date" in df.columns:
+            value_cols = [c for c in df.columns if c != "Date"]
+        else:
+            value_cols = list(df.columns)
+        for col in value_cols:
+            vals = pd.to_numeric(df[col], errors="coerce").dropna().values
+            if len(vals) == 0:
+                continue
+            mean = float(vals.mean())
+            std = float(vals.std(ddof=0))
+            max_day = float(vals.max())
+            min_day = float(vals.min())
+            monthly_total = float(vals.sum())
+            cv = (std / mean * 100) if mean else 0.0
+            if mean > 3000:
+                demand_level = "Very High"
+            elif mean > 1500:
+                demand_level = "High"
+            elif mean > 800:
+                demand_level = "Medium"
+            else:
+                demand_level = "Low"
+            station_stats.append(
+                {
+                    "station_name": str(col).strip(),
+                    "month": latest_month,
+                    "avg_daily_sales_lt": round(mean, 2),
+                    "std_dev_lt": round(std, 2),
+                    "max_day_lt": round(max_day, 2),
+                    "min_day_lt": round(min_day, 2),
+                    "total_sales_lt": round(monthly_total, 2),
+                    "cv_pct": round(cv, 2),
+                    "demand_level": demand_level,
+                }
+            )
+    else:
+        monthly_group = sales_df.groupby("station_name")
+        for station_name, group in monthly_group:
+            avg_daily = float(pd.to_numeric(group["avg_daily_sales_lt"], errors="coerce").mean())
+            vals = pd.to_numeric(group["total_sales_lt"], errors="coerce").dropna()
+            std = float(vals.std(ddof=0)) if not vals.empty else 0.0
+            cv = (std / avg_daily * 100) if avg_daily else 0.0
+            station_stats.append(
+                {
+                    "station_name": station_name,
+                    "month": latest_month,
+                    "avg_daily_sales_lt": round(avg_daily, 2),
+                    "std_dev_lt": round(std, 2),
+                    "max_day_lt": 0.0,
+                    "min_day_lt": 0.0,
+                    "total_sales_lt": round(float(vals.sum()) if not vals.empty else 0.0, 2),
+                    "cv_pct": round(cv, 2),
+                    "demand_level": "Medium",
+                }
+            )
+
+    station_stats.sort(key=lambda item: item["avg_daily_sales_lt"], reverse=True)
+    top_stations = station_stats[:20]
+    volatile_stations = sorted(station_stats, key=lambda item: item["cv_pct"], reverse=True)[:20]
+
+    return {
+        "top_stations": top_stations,
+        "volatile_stations": volatile_stations,
+        "monthly_summary": monthly_summary,
+        "all_stations": station_stats,
+    }
+
+
+def build_kpi_cards(kpi_dict):
+    return [
+        {
+            "title": "LPG To Be Delivered Today",
+            "value": f"{kpi_dict.get('total_lt', 0):,.0f} Lt ({kpi_dict.get('total_mt', 0):,.2f} MT)",
+            "description": f"{kpi_dict.get('total_runs', 0)} run(s) in the suggested delivery sequence.",
+            "status": "OK" if kpi_dict.get("total_runs", 0) > 0 else "NO RUNS",
+        },
+        {
+            "title": "Trucks To Be Deployed",
+            "value": f"{kpi_dict.get('trucks_deployed', 0)} / {kpi_dict.get('trucks_total', 0)}",
+            "description": (
+                f"Standby {kpi_dict.get('trucks_standby', 0)} | Utilisation {kpi_dict.get('utilisation_pct', 0):.1f}%"
+            ),
+            "status": "OK" if kpi_dict.get("trucks_deployed", 0) > 0 else "LOW",
+        },
+        {
+            "title": "Stations Fully Deliverable",
+            "value": f"{kpi_dict.get('stations_served', 0)} / {kpi_dict.get('stations_needing', 0)}",
+            "description": "",
+            "status": "OK" if kpi_dict.get("stations_unserved", 0) == 0 else "ALERT",
+        },
+        {
+            "title": "Total Cost Estimate For Today",
+            "value": f"Rs {kpi_dict.get('grand_total', 0):,.0f}",
+            "description": (
+                f"Purchase Rs {kpi_dict.get('tot_purchase', 0):,.0f} | "
+                f"Transport Rs {kpi_dict.get('tot_transport', 0):,.0f} | "
+                f"Toll Rs {kpi_dict.get('tot_toll', 0):,.0f}"
+            ),
+            "status": "OK",
+        },
+        {
+            "title": "Cost Estimate Per MT",
+            "value": f"Rs {kpi_dict.get('cost_per_mt', 0):,.0f}",
+            "description": f"Cost per litre: Rs {kpi_dict.get('cost_per_lt', 0):,.4f}",
+            "status": "OK",
+        },
+        {
+            "title": "Purchase vs Transport",
+            "value": (
+                f"Purchase {kpi_dict.get('purchase_pct', 0):.1f}% | "
+                f"Transport {kpi_dict.get('transport_pct', 0):.1f}% | "
+                f"Toll {kpi_dict.get('toll_pct', 0):.1f}%"
+            ),
+            "description": "Cost split for today's plan",
+            "status": "INFO",
+        },
+        {
+            "title": "Sources Used",
+            "value": f"{kpi_dict.get('sources_used', 0)}",
+            "description": "Unique source terminals selected by optimizer",
+            "status": "OK",
+        },
+        {
+            "title": "Monthly Sales",
+            "value": f"{kpi_dict.get('monthly_total_lt', 0):,.0f} Lt",
+            "description": "",
+            "status": "INFO",
+        },
+    ]
+
+
+def refresh_news(db):
+    try:
+        articles, fetched_at, _errors = l3.fetch_lpg_news()
+    except Exception:
+        return
+
+    if not articles:
+        return
+
+    ops = []
+    for article in articles[:60]:
+        title = str(article.get("title") or "").strip()
+        url = str(article.get("url") or "").strip()
+        if not title:
+            continue
+        dedupe_key = hashlib.sha1(f"{title.lower()}|{url}".encode("utf-8")).hexdigest()
+        summary = str(article.get("description") or "").strip()
+        source = str(article.get("source") or "Google News").strip() or "Google News"
+        published = article.get("published_dt")
+        ops.append(
+            UpdateOne(
+                {"dedupe_key": dedupe_key},
+                {
+                    "$set": {
+                        "title": title,
+                        "url": url,
+                        "source": source,
+                        "summary": summary[:600],
+                        "category": "LPG Industry",
+                        "published_at": published,
+                        "fetched_at": fetched_at,
+                        "dedupe_key": dedupe_key,
+                    }
+                },
+                upsert=True,
+            )
+        )
+
+    if ops:
+        db["lpgNews"].bulk_write(ops, ordered=False)
+
+
+def write_plan(db, delivery_plans, fleet_status, trucks, unserved, stations_df, sources_df, sales_df, sales_raw):
+    created_at = datetime.now(timezone.utc)
     cost_summary, totals = build_cost_summary(delivery_plans)
-    deficit_count = sum(len(dp.get("stops", [])) for dp in delivery_plans)
 
     db["delivery"].insert_one(
         {
             "plan_id": PLAN_ID,
-            "created_at": datetime.utcnow(),
+            "created_at": created_at,
             "delivery_plans": delivery_plans,
             "fleet_status": fleet_status,
             "meta": {
-                "stations_in_deficit": deficit_count,
-                "start_positions": start_positions,
+                "rules": {
+                    "max_stops_per_truck": int(l3.MAX_STOPS_PER_TRUCK),
+                    "no_refueling": True,
+                    "return_to_same_source": True,
+                    "alternating_split": True,
+                    "source": "pythonLogic/logic3.py",
+                }
             },
         }
     )
 
-    truck_positions = []
-    for t in trucks:
-        truck_positions.append(
-            {
-                "truck_id": t["truck_id"],
-                "type": t["type"],
-                "station": t["parked_station"],
-                "lat": t["parked_lat"],
-                "lon": t["parked_lon"],
-            }
-        )
-
     db["truckPlanning"].insert_one(
         {
             "plan_id": PLAN_ID,
-            "created_at": datetime.utcnow(),
-            "truck_positions": truck_positions,
-            "meta": {},
+            "created_at": created_at,
+            "truck_positions": [
+                {
+                    "truck_id": truck["truck_id"],
+                    "type": truck["type"],
+                    "station": truck.get("parked_station"),
+                    "source": truck.get("parked_source"),
+                    "source_id": truck.get("parked_source_id"),
+                    "lat": truck.get("parked_lat"),
+                    "lon": truck.get("parked_lon"),
+                    "state": truck.get("state"),
+                }
+                for truck in trucks
+            ],
+            "meta": {"source": "pythonLogic/logic3.py"},
         }
     )
 
     db["tentativeCost"].insert_one(
         {
             "plan_id": PLAN_ID,
-            "created_at": datetime.utcnow(),
+            "created_at": created_at,
             "cost_summary": cost_summary,
             "totals": totals,
-            "meta": {},
+            "meta": {"source": "pythonLogic/logic3.py"},
         }
     )
 
     db["unservedStations"].insert_one(
         {
             "plan_id": PLAN_ID,
-            "created_at": datetime.utcnow(),
+            "created_at": created_at,
             "unserved": unserved,
-            "resolutions": resolutions,
-            "summary": build_unserved_summary(resolutions),
-            "meta": {},
+            "resolutions": [],
+            "summary": {
+                "total": len(unserved),
+                "today": len(unserved),
+                "tomorrow": 0,
+                "manual_review": 0,
+                "swap_suggestions": 0,
+                "pending": len(unserved),
+                "accepted": 0,
+                "rejected": 0,
+            },
+            "meta": {"source": "pythonLogic/logic3.py"},
         }
     )
+
+    kpi_dict = l3.compute_kpis(delivery_plans, fleet_status, stations_df, sources_df, sales_raw)
+    analytics_doc = {
+        "plan_id": PLAN_ID,
+        "created_at": created_at,
+        "kpi_dashboard": build_kpi_cards(kpi_dict),
+        "kpi_summary": kpi_dict,
+        "source_comparison": build_source_comparison(sources_df, delivery_plans),
+        "station_intelligence": build_station_intelligence(sales_df, sales_raw),
+        "meta": {"source": "pythonLogic/logic3.py"},
+    }
+    db["analyticsDashboard"].insert_one(analytics_doc)
+
+    updates = []
+    for truck in trucks:
+        station = truck.get("parked_station") if truck.get("state") == "atStation" else None
+        source = truck.get("parked_source") if truck.get("state") == "atSource" else None
+        source_id = truck.get("parked_source_id") if truck.get("state") == "atSource" else None
+        lat = truck.get("parked_lat") if truck.get("state") in ("atStation", "atSource") else truck.get("parked_lat")
+        lon = truck.get("parked_lon") if truck.get("state") in ("atStation", "atSource") else truck.get("parked_lon")
+
+        updates.append(
+            UpdateOne(
+                {"truck_id": truck["truck_id"]},
+                {
+                    "$set": {
+                        "station": station,
+                        "source": source,
+                        "source_id": source_id,
+                        "lat": lat,
+                        "lon": lon,
+                        "state": truck.get("state") or "travelling",
+                    }
+                },
+            )
+        )
+
+    if updates:
+        db["truck"].bulk_write(updates, ordered=False)
 
 
 def main():
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
 
-    stations, sources = load_from_db(db)
-    trucks = build_fleet_from_db(stations, db)
+    stations, sources, trucks = load_from_db(db)
+    avg_sales, sales_df, sales_raw = load_sales_context(db)
+    stations_df = build_stations_df(stations)
+    sources_df = build_sources_df(sources)
 
-    (
+    delivery_plans, fleet_status, trucks, unserved = build_plan(stations, sources, trucks, avg_sales)
+    write_plan(
+        db,
         delivery_plans,
         fleet_status,
         trucks,
-        start_positions,
         unserved,
-        resolutions,
-    ) = build_plan(stations, sources, trucks)
-    write_plan(
-        db, delivery_plans, fleet_status, trucks, start_positions, unserved, resolutions
+        stations_df,
+        sources_df,
+        sales_df,
+        sales_raw,
     )
+    refresh_news(db)
+
     client.close()
 
 

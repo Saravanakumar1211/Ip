@@ -8,6 +8,7 @@ import dataRoutes from "./routes/dataRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 import managerRoutes from "./routes/managerRoutes.js";
+import sharedRoutes from "./routes/sharedRoutes.js";
 import { ensureAdminUser } from "./services/ensureAdminUser.js";
 import { seedStationManagers } from "./services/seedStationManagers.js";
 import { ensureTruckStates } from "./services/ensureTruckStates.js";
@@ -27,6 +28,7 @@ app.get("/health", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/manager", managerRoutes);
+app.use("/api", sharedRoutes);
 app.use("/api", dataRoutes);
 
 connectDB()

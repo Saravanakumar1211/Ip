@@ -35,6 +35,8 @@ const emptyTruckForm = {
   truck_id: "",
   type: "",
   station: "",
+  source: "",
+  state: "travelling",
   lat: "",
   lon: ""
 };
@@ -71,7 +73,30 @@ const buildDirectionsUrl = ({ origin, destination, waypoints }) => {
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 };
 
-const VIEW_KEYS = ["menu", "stations", "sources", "trucks", "deficit", "managers"];
+const formatDateTime = (value) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+};
+
+const VIEW_KEYS = [
+  "menu",
+  "stations",
+  "sources",
+  "trucks",
+  "deficit",
+  "managers",
+  "analytics",
+  "news"
+];
+const ANALYTICS_TABS = ["kpi", "source", "station"];
 
 
 const computeSufficientFuel = (capacity, deadStock) => {
@@ -167,8 +192,22 @@ function App() {
     usable_lt: ""
   });
   const [managerAvailableTrucks, setManagerAvailableTrucks] = useState([]);
+  const [managerSources, setManagerSources] = useState([]);
+  const [managerTruckSourceTarget, setManagerTruckSourceTarget] = useState({});
   const [managerTruckSaving, setManagerTruckSaving] = useState(false);
   const [managerStockSaving, setManagerStockSaving] = useState(false);
+  const [managerNewsPage, setManagerNewsPage] = useState(false);
+
+  const [newsFeed, setNewsFeed] = useState([]);
+  const [newsLoading, setNewsLoading] = useState(false);
+  const [newsError, setNewsError] = useState("");
+  const [newsTickerIndex, setNewsTickerIndex] = useState(0);
+  const [selectedNewsId, setSelectedNewsId] = useState("");
+
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [analyticsError, setAnalyticsError] = useState("");
+  const [analyticsTab, setAnalyticsTab] = useState("kpi");
 
   const totals = useMemo(() => {
     const capacity = stations.reduce((sum, item) => sum + (item.capacity_in_lt || 0), 0);
@@ -191,6 +230,14 @@ function App() {
     [managerAvailableTrucks, managerTruckForm.truck_id]
   );
   const noAvailableTrucks = managerAvailableTrucks.length === 0;
+  const tickerNews = newsFeed.length ? newsFeed[newsTickerIndex % newsFeed.length] : null;
+  const selectedNews = useMemo(
+    () => newsFeed.find((item) => item.id === selectedNewsId) || newsFeed[0] || null,
+    [newsFeed, selectedNewsId]
+  );
+  const analyticsKpis = analyticsData?.kpi_dashboard || [];
+  const analyticsSources = analyticsData?.source_comparison || [];
+  const analyticsStationIntel = analyticsData?.station_intelligence || {};
 
 
 
@@ -345,6 +392,34 @@ function App() {
           next.lon = match.coordinates.lng ?? match.coordinates.lon ?? "";
         }
       }
+      if (field === "source") {
+        const match = sources.find(
+          (item) =>
+            String(item.source_name || "").trim().toLowerCase() ===
+            String(value || "").trim().toLowerCase()
+        );
+        if (match?.coordinates) {
+          next.lat = match.coordinates.lat ?? "";
+          next.lon = match.coordinates.lng ?? match.coordinates.lon ?? "";
+          next.state = "atSource";
+        }
+      }
+      if (field === "state") {
+        if (value === "travelling") {
+          next.station = "";
+          next.source = "";
+        }
+        if (value === "atStation") {
+          next.source = "";
+        }
+        if (value === "atSource") {
+          next.station = "";
+        }
+        if (value === "atMaintenance") {
+          next.station = "";
+          next.source = "";
+        }
+      }
       return next;
     });
   };
@@ -387,9 +462,15 @@ function App() {
 
   const resolveTruckState = (truck) => {
     const state = String(truck?.state || "").trim();
-    if (state === "atStation" || state === "maintenance" || state === "travelling") {
+    if (
+      state === "atStation" ||
+      state === "atSource" ||
+      state === "atMaintenance" ||
+      state === "travelling"
+    ) {
       return state;
     }
+    if (truck?.source) return "atSource";
     return truck?.station ? "atStation" : "travelling";
   };
 
@@ -403,6 +484,16 @@ function App() {
     return match?.coordinates || null;
   };
 
+  const getSourceCoordinates = (sourceName) => {
+    if (!sourceName) return null;
+    const match = sources.find(
+      (source) =>
+        String(source.source_name || "").trim().toLowerCase() ===
+        String(sourceName || "").trim().toLowerCase()
+    );
+    return match?.coordinates || null;
+  };
+
   const formatCapacity = (value) => {
     if (value === null || value === undefined) return "";
     const raw = String(value).trim();
@@ -411,47 +502,105 @@ function App() {
     return match ? match[1] : raw;
   };
 
-  const buildDeliverySequence = (plan) => {
-    if (!plan) return "";
-    const steps = plan.journey_steps || plan.journeySteps;
-    if (Array.isArray(steps) && steps.length) {
-      const sequence = steps
-        .map((step) => {
-          if (!step) return "";
-          if (step.step_type === "LOAD") {
-            return `${step.location} (Load)`;
-          }
-          if (step.step_type === "RELOAD") {
-            return `${step.location} (Reload)`;
-          }
-          if (step.step_type === "INITIAL_PARK") {
-            return `${step.location} (Start)`;
-          }
-          if (step.step_type === "FINAL_PARK") {
-            return `${step.location} (End)`;
-          }
-          return step.location || step.label || "";
-        })
-        .filter(Boolean);
-      return sequence.join(" -> ");
+  const normalizeSequenceLabel = (value) =>
+    String(value || "").trim().toLowerCase();
+
+  const normalizeSequenceKey = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+
+  const labelsLikelySameLocation = (left, right) => {
+    const a = normalizeSequenceKey(left);
+    const b = normalizeSequenceKey(right);
+    if (!a || !b) return false;
+    return a === b || a.includes(b) || b.includes(a);
+  };
+
+  const startsAtSource = (plan, startNode, sourceNode) => {
+    if (!startNode || !sourceNode) return false;
+    if (startNode.kind !== "start" || sourceNode.kind !== "source") return false;
+    if (labelsLikelySameLocation(startNode.label, sourceNode.label)) return true;
+
+    const initialPark = plan?.initial_park;
+    const sourceLabel = plan?.source_name || plan?.source_id;
+    if (!initialPark || !sourceLabel) return false;
+
+    return (
+      labelsLikelySameLocation(initialPark, sourceLabel) &&
+      labelsLikelySameLocation(startNode.label, initialPark)
+    );
+  };
+
+  const collapseSequenceNodes = (nodes, plan) => {
+    const filtered = (nodes || [])
+      .filter((node) => node?.label)
+      .map((node) => ({ ...node, label: String(node.label).trim() }));
+    if (filtered.length >= 2) {
+      const first = filtered[0];
+      const second = filtered[1];
+      if (startsAtSource(plan, first, second)) {
+        filtered.shift();
+      }
     }
 
-    const sequence = [];
-    const initial = plan.initial_park || "Unknown start";
-    sequence.push(initial);
-    const sourceLabel = plan.source_name || plan.source_id || "Source";
-    sequence.push(sourceLabel);
-    const stops = (plan.stops || [])
-      .map((stop) => stop.station)
-      .filter(Boolean);
-    if (stops.length) {
-      sequence.push(...stops);
+    const deduped = [];
+    for (const node of filtered) {
+      const prev = deduped[deduped.length - 1];
+      if (
+        prev &&
+        normalizeSequenceLabel(prev.label) === normalizeSequenceLabel(node.label)
+      ) {
+        if (prev.kind !== "source" && node.kind === "source") {
+          deduped[deduped.length - 1] = node;
+        }
+        continue;
+      }
+      deduped.push(node);
     }
-    if (plan.final_park) {
-      sequence.push(plan.final_park);
-    }
-    return sequence.join(" -> ");
+    return deduped;
   };
+
+  const buildSequenceNodes = (plan) => {
+    const steps = plan?.journey_steps || [];
+    if (steps.length) {
+      return collapseSequenceNodes(
+        steps
+          .map((step) => {
+            if (!step?.location) return null;
+            if (step.step_type === "INITIAL_PARK") {
+              return { label: step.location, kind: "start" };
+            }
+            if (step.step_type === "LOAD" || step.step_type === "RELOAD") {
+              return { label: step.location, kind: "source" };
+            }
+            if (step.step_type === "DELIVER") {
+              return { label: step.location, kind: "stop" };
+            }
+            if (step.step_type === "FINAL_PARK") {
+              return { label: step.location, kind: "end" };
+            }
+            return { label: step.location, kind: "stop" };
+          })
+          .filter(Boolean),
+        plan
+      );
+    }
+
+    const fallbackNodes = [
+      { label: plan?.initial_park || "Start", kind: "start" },
+      { label: plan?.source_name || plan?.source_id || "Source", kind: "source" },
+      ...(plan?.stops || []).map((stop) => ({ label: stop.station, kind: "stop" })),
+      { label: plan?.final_park || "End", kind: "end" }
+    ];
+    return collapseSequenceNodes(fallbackNodes, plan);
+  };
+
+  const buildDeliverySequence = (plan) =>
+    buildSequenceNodes(plan)
+      .map((node) => node.label)
+      .join(" -> ");
 
   const resetSourceForm = () => {
     setSourceForm(emptySourceForm);
@@ -597,32 +746,54 @@ function App() {
     const truckId = truckForm.truck_id.trim();
     const type = truckForm.type.trim();
     const station = truckForm.station.trim();
+    const source = truckForm.source.trim();
+    const state = truckForm.state;
     let lat = parseNumber(truckForm.lat);
     let lon = parseNumber(truckForm.lon);
 
     if (!truckId) errors.push("truck id");
     if (!type) errors.push("capacity in mt");
-    if (!station) errors.push("station");
-    if (lat === null || lon === null) {
-      const match = stations.find(
-        (item) =>
-          String(item.station || "").trim().toLowerCase() ===
-          station.trim().toLowerCase()
-      );
-      if (match?.coordinates) {
-        lat = match.coordinates.lat;
-        lon = match.coordinates.lng ?? match.coordinates.lon;
+    if (state === "atStation") {
+      if (!station) errors.push("station");
+      if (lat === null || lon === null) {
+        const match = stations.find(
+          (item) =>
+            String(item.station || "").trim().toLowerCase() ===
+            station.trim().toLowerCase()
+        );
+        if (match?.coordinates) {
+          lat = match.coordinates.lat;
+          lon = match.coordinates.lng ?? match.coordinates.lon;
+        }
       }
     }
-    if (lat === null || lon === null) errors.push("coordinates");
+    if (state === "atSource") {
+      if (!source) errors.push("source");
+      if (lat === null || lon === null) {
+        const match = sources.find(
+          (item) =>
+            String(item.source_name || "").trim().toLowerCase() ===
+            source.trim().toLowerCase()
+        );
+        if (match?.coordinates) {
+          lat = match.coordinates.lat;
+          lon = match.coordinates.lng ?? match.coordinates.lon;
+        }
+      }
+    }
+    if ((state === "atStation" || state === "atSource") && (lat === null || lon === null)) {
+      errors.push("coordinates");
+    }
 
     return {
       payload: {
         truck_id: truckId,
         type,
-        station,
-        lat,
-        lon
+        station: state === "atStation" ? station : "",
+        source: state === "atSource" ? source : "",
+        lat: state === "atStation" || state === "atSource" ? lat : null,
+        lon: state === "atStation" || state === "atSource" ? lon : null,
+        state
       },
       errors
     };
@@ -697,6 +868,18 @@ function App() {
     setManagerTruckForm({ truck_id: "" });
     setManagerStockForm({ dead_stock_in_lt: "", usable_lt: "" });
     setManagerAvailableTrucks([]);
+    setManagerSources([]);
+    setManagerTruckSourceTarget({});
+    setManagerNewsPage(false);
+    setNewsFeed([]);
+    setNewsLoading(false);
+    setNewsError("");
+    setNewsTickerIndex(0);
+    setSelectedNewsId("");
+    setAnalyticsData(null);
+    setAnalyticsLoading(false);
+    setAnalyticsError("");
+    setAnalyticsTab("kpi");
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(FORM_STORAGE_KEY);
     window.history.replaceState(null, "", "#");
@@ -723,6 +906,53 @@ function App() {
     }
   };
 
+  const fetchNewsFeed = async (token) => {
+    setNewsLoading(true);
+    setNewsError("");
+    try {
+      const headers = { Authorization: `Bearer ${token}` };
+      const response = await axios.get(`${API_BASE}/news/feed`, { headers });
+      const items = response.data?.items || [];
+      setNewsFeed(items);
+      setNewsTickerIndex(0);
+      if (items.length && !selectedNewsId) {
+        setSelectedNewsId(items[0].id);
+      }
+    } catch (fetchError) {
+      setNewsError(fetchError.response?.data?.message || "Unable to load LPG news.");
+    } finally {
+      setNewsLoading(false);
+    }
+  };
+
+  const fetchAnalytics = async (token) => {
+    setAnalyticsLoading(true);
+    setAnalyticsError("");
+    try {
+      const headers = { Authorization: `Bearer ${token}` };
+      const response = await axios.get(`${API_BASE}/analytics/latest`, { headers });
+      setAnalyticsData(response.data || null);
+    } catch (fetchError) {
+      setAnalyticsData(null);
+      setAnalyticsError(
+        fetchError.response?.data?.message || "Unable to load analytics dashboard."
+      );
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  };
+
+  const openNewsView = (newsId) => {
+    if (newsId) {
+      setSelectedNewsId(newsId);
+    }
+    if (auth.role === "admin") {
+      navigateView("news");
+      return;
+    }
+    setManagerNewsPage(true);
+  };
+
   const fetchManagerOverview = async () => {
     setManagerLoading(true);
     setManagerErrorMsg("");
@@ -734,6 +964,8 @@ function App() {
       setManagerStation(station);
       setManagerTrucks(response.data.trucks || []);
       setManagerAvailableTrucks(response.data.available_trucks || []);
+      setManagerSources(response.data.sources || []);
+      setManagerTruckSourceTarget({});
       setManagerStockForm({
         dead_stock_in_lt: station?.dead_stock_in_lt ?? "",
         usable_lt: station?.usable_lt ?? ""
@@ -757,6 +989,8 @@ function App() {
       const headers = { Authorization: `Bearer ${auth.token}` };
       const response = await axios.post(`${API_BASE}/route-plan`, {}, { headers });
       setRoutePlanData(response.data);
+      fetchAnalytics(auth.token);
+      fetchNewsFeed(auth.token);
     } catch (planError) {
       setRoutePlanError(
         planError.response?.data?.message || "Unable to generate route plan."
@@ -849,14 +1083,32 @@ function App() {
     }
   };
 
-  const handleManagerTruckRemove = async (truckId) => {
+  const updateManagerTruckSourceTarget = (truckId, sourceId) => {
     clearManagerDashboardMessages();
+    setManagerTruckSourceTarget((prev) => ({
+      ...prev,
+      [truckId]: sourceId
+    }));
+  };
+
+  const handleManagerTruckRemove = async (truckId, options = {}) => {
+    clearManagerDashboardMessages();
+    const target = options?.target || "travelling";
+    const sourceId = String(options?.sourceId || "").trim();
+    if (target === "source" && !sourceId) {
+      setManagerErrorMsg("Please select a source before sending this truck.");
+      return;
+    }
     setManagerTruckSaving(true);
 
     try {
       const headers = { Authorization: `Bearer ${auth.token}` };
+      const requestConfig = { headers };
+      if (target === "source") {
+        requestConfig.data = { target: "source", source_id: sourceId };
+      }
       const response = await axios.delete(`${API_BASE}/manager/trucks/${truckId}`, {
-        headers
+        ...requestConfig
       });
       setManagerTrucks((prev) => prev.filter((truck) => truck._id !== truckId));
       if (response.data?._id) {
@@ -868,7 +1120,19 @@ function App() {
           );
         });
       }
-      setManagerNoticeMsg("Truck removed from this station.");
+      setManagerTruckSourceTarget((prev) => {
+        if (!Object.prototype.hasOwnProperty.call(prev, truckId)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[truckId];
+        return next;
+      });
+      setManagerNoticeMsg(
+        target === "source"
+          ? "Truck removed from this station and sent to source."
+          : "Truck removed from this station."
+      );
     } catch (removeError) {
       setManagerErrorMsg(
         removeError.response?.data?.message || "Unable to remove truck."
@@ -921,6 +1185,28 @@ function App() {
       fetchManagerOverview();
     }
   }, [auth.token, auth.role]);
+
+  useEffect(() => {
+    if (auth.token) {
+      fetchNewsFeed(auth.token);
+    }
+  }, [auth.token]);
+
+  useEffect(() => {
+    if (auth.token && auth.role === "admin" && activeView === "analytics") {
+      fetchAnalytics(auth.token);
+    }
+  }, [auth.token, auth.role, activeView]);
+
+  useEffect(() => {
+    if (newsFeed.length <= 1) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNewsTickerIndex((prev) => (prev + 1) % newsFeed.length);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [newsFeed]);
 
   const handleSourceSubmit = async (event) => {
     event.preventDefault();
@@ -1134,6 +1420,8 @@ function App() {
       truck_id: item.truck_id || "",
       type: formatCapacity(item.type || ""),
       station: item.station || "",
+      source: item.source || "",
+      state: resolveTruckState(item),
       lat: item.lat ?? "",
       lon: item.lon ?? ""
     });
@@ -1316,8 +1604,105 @@ function App() {
         {managerErrorMsg && <p className="error">{managerErrorMsg}</p>}
         {managerNoticeMsg && <p className="notice">{managerNoticeMsg}</p>}
         {managerAlertMsg && <p className="notice error">{managerAlertMsg}</p>}
+        {newsError && <p className="notice error">{newsError}</p>}
 
-        {managerLoading ? (
+        <section className="news-strip">
+          <div className="news-strip-head">
+            <strong>LPG News Feed</strong>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => fetchNewsFeed(auth.token)}
+              disabled={newsLoading}
+            >
+              {newsLoading ? "Refreshing..." : "Refresh News"}
+            </button>
+          </div>
+          {tickerNews ? (
+            <button
+              type="button"
+              className="news-ticker"
+              onClick={() => openNewsView(tickerNews.id)}
+            >
+              <span className="news-ticker-track">
+                {tickerNews.title} - {tickerNews.source}
+              </span>
+            </button>
+          ) : (
+            <p className="table-sub">No news available right now.</p>
+          )}
+        </section>
+
+        {managerNewsPage ? (
+          <section className="table-wrap">
+            <div className="table-header">
+              <div>
+                <h2>LPG Industry News</h2>
+                <p className="table-sub">Click any headline to open the original article.</p>
+              </div>
+              <div className="table-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => setManagerNewsPage(false)}
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+            {selectedNews && (
+              <article className="news-highlight">
+                <h3>{selectedNews.title}</h3>
+                <p className="table-sub">
+                  {selectedNews.source} | {formatDateTime(selectedNews.published_at)}
+                </p>
+                {selectedNews.url ? (
+                  <p className="table-sub">
+                    <a
+                      className="location-link"
+                      href={selectedNews.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open original article
+                    </a>
+                  </p>
+                ) : null}
+              </article>
+            )}
+            <table>
+              <thead>
+                <tr>
+                  <th>Headline</th>
+                  <th>Source</th>
+                  <th>Published</th>
+                </tr>
+              </thead>
+              <tbody>
+                {newsFeed.map((item) => (
+                  <tr
+                    key={item.id}
+                    className={item.id === selectedNews?.id ? "news-row-selected" : ""}
+                  >
+                    <td>
+                      <a
+                        className="location-link"
+                        href={item.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onMouseEnter={() => setSelectedNewsId(item.id)}
+                      >
+                        {item.title}
+                      </a>
+                    </td>
+                    <td>{item.source}</td>
+                    <td>{formatDateTime(item.published_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+        ) : managerLoading ? (
           <section className="loading-state">
             <p>Loading station dashboard...</p>
           </section>
@@ -1458,32 +1843,16 @@ function App() {
                     <tr>
                       <th>Truck ID</th>
                       <th>Capacity (MT)</th>
-                      <th>Location</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {managerTrucks.length ? (
                       managerTrucks.map((truck) => {
-                        const mapUrl = toMapUrl({ lat: truck.lat, lon: truck.lon });
                         return (
                           <tr key={truck._id}>
                             <td>{truck.truck_id}</td>
                             <td>{formatCapacity(truck.type) || "-"}</td>
-                            <td>
-                              {mapUrl ? (
-                                <a
-                                  className="location-link"
-                                  href={mapUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {truck.lat}, {truck.lon}
-                                </a>
-                              ) : (
-                                "-"
-                              )}
-                            </td>
                             <td>
                               <div className="action-buttons">
                                 <button
@@ -1493,6 +1862,39 @@ function App() {
                                   disabled={managerTruckSaving}
                                 >
                                   Remove
+                                </button>
+                                <select
+                                  className="action-select"
+                                  value={managerTruckSourceTarget[truck._id] || ""}
+                                  onChange={(event) =>
+                                    updateManagerTruckSourceTarget(
+                                      truck._id,
+                                      event.target.value
+                                    )
+                                  }
+                                  disabled={managerTruckSaving || !managerSources.length}
+                                >
+                                  <option value="">Select source</option>
+                                  {managerSources.map((source) => (
+                                    <option key={source.source_id} value={source.source_id}>
+                                      {source.source_name} ({source.source_id})
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  className="secondary"
+                                  onClick={() =>
+                                    handleManagerTruckRemove(truck._id, {
+                                      target: "source",
+                                      sourceId: managerTruckSourceTarget[truck._id]
+                                    })
+                                  }
+                                  disabled={
+                                    managerTruckSaving || !managerTruckSourceTarget[truck._id]
+                                  }
+                                >
+                                  Send to Source
                                 </button>
                                 <button
                                   type="button"
@@ -1509,7 +1911,7 @@ function App() {
                       })
                     ) : (
                       <tr>
-                        <td colSpan={4}>No trucks parked at this station.</td>
+                        <td colSpan={3}>No trucks parked at this station.</td>
                       </tr>
                     )}
                   </tbody>
@@ -1556,6 +1958,34 @@ function App() {
       </header>
 
       {error && <p className="error">{error}</p>}
+      {newsError && <p className="notice error">{newsError}</p>}
+
+      <section className="news-strip">
+        <div className="news-strip-head">
+          <strong>LPG News Feed</strong>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => fetchNewsFeed(auth.token)}
+            disabled={newsLoading}
+          >
+            {newsLoading ? "Refreshing..." : "Refresh News"}
+          </button>
+        </div>
+        {tickerNews ? (
+          <button
+            type="button"
+            className="news-ticker"
+            onClick={() => openNewsView(tickerNews.id)}
+          >
+            <span className="news-ticker-track">
+              {tickerNews.title} - {tickerNews.source}
+            </span>
+          </button>
+        ) : (
+          <p className="table-sub">No news available right now.</p>
+        )}
+      </section>
 
       {activeView === "menu" && (
         <section className="stats">
@@ -1602,6 +2032,15 @@ function App() {
                   ) : (
                     deliveryPlans.map((plan, index) => {
                       const stops = plan.stops || [];
+                      const totalNeededLt = stops.reduce(
+                        (sum, stop) => sum + Number(stop.needed_lt || 0),
+                        0
+                      );
+                      const totalDeliveredLt = stops.reduce(
+                        (sum, stop) => sum + Number(stop.deliver_lt || 0),
+                        0
+                      );
+                      const notFullyDeliverable = totalDeliveredLt < totalNeededLt;
                       const directionsUrl = buildDirectionsUrl({
                         origin: {
                           lat: plan.initial_park_lat,
@@ -1628,9 +2067,17 @@ function App() {
                                 Truck {plan.truck_id} - Source{" "}
                                 {plan.source_name || plan.source_id}
                               </h5>
-                              <p className="delivery-sequence">
-                                Delivery sequence: {buildDeliverySequence(plan)}
+                              <p className="table-sub">
+                                {buildDeliverySequence(plan)}
                               </p>
+                              <div className="sequence-diagram">
+                                {buildSequenceNodes(plan).map((node, nodeIndex, nodes) => (
+                                  <div key={`${node.label}-${nodeIndex}`} className="sequence-node-wrap">
+                                    <span className={`sequence-node ${node.kind}`}>{node.label}</span>
+                                    {nodeIndex < nodes.length - 1 && <span className="sequence-arrow">→</span>}
+                                  </div>
+                                ))}
+                              </div>
                             </div>
                             <div className="plan-total-chip">
                               <span className="plan-total-label">
@@ -1671,6 +2118,33 @@ function App() {
                               <p>{numberFmt.format(plan.grand_total)}</p>
                             </div>
                           </div>
+                          {notFullyDeliverable ? (
+                            <>
+                              <p className="notice error">
+                                Total demand can't be fully delivered in this run.
+                                Needed {numberFmt.format(totalNeededLt)} Lt, planned{" "}
+                                {numberFmt.format(totalDeliveredLt)} Lt.
+                              </p>
+                              <table>
+                                <thead>
+                                  <tr>
+                                    <th>Station</th>
+                                    <th>Delivered LT</th>
+                                    <th>Split %</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {stops.map((stop, stopIndex) => (
+                                    <tr key={`${stop.station}-${stopIndex}`}>
+                                      <td>{stop.station}</td>
+                                      <td>{numberFmt.format(stop.deliver_lt || 0)}</td>
+                                      <td>{(Number(stop.split_pct) || 0).toFixed(1)}%</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </>
+                          ) : null}
                         </div>
                       );
                     })
@@ -1687,6 +2161,8 @@ function App() {
                             <th>Truck</th>
                             <th>Capacity (MT)</th>
                             <th>Final Station</th>
+                            <th>Final Source</th>
+                            <th>State</th>
                             <th>Location</th>
                           </tr>
                         </thead>
@@ -1700,7 +2176,9 @@ function App() {
                               <tr key={truck.truck_id}>
                                 <td>{truck.truck_id}</td>
                                 <td>{formatCapacity(truck.type) || "-"}</td>
-                                <td>{truck.station}</td>
+                                <td>{truck.station || "-"}</td>
+                                <td>{truck.source || "-"}</td>
+                                <td>{truck.state || "-"}</td>
                                 <td>
                                   {mapUrl ? (
                                     <a
@@ -1826,6 +2304,22 @@ function App() {
             <h3>Add Station Manager</h3>
             <p>Create and onboard new station manager accounts.</p>
           </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => navigateView("analytics")}
+          >
+            <h3>Analytics Dashboard</h3>
+            <p>KPI dashboard, source comparison, and station intelligence.</p>
+          </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => navigateView("news")}
+          >
+            <h3>LPG News Feed</h3>
+            <p>Read recent LPG industry updates and open full stories.</p>
+          </button>
         </section>
       )}
 
@@ -1835,6 +2329,270 @@ function App() {
         </section>
       ) : (
         <section className="grid">
+          {activeView === "analytics" && (
+          <article className="table-wrap">
+            <div className="table-header">
+              <div>
+                <h2>Analytics Dashboard</h2>
+                <p className="table-sub">
+                  Insights generated from monthly sales and delivery planning data.
+                </p>
+              </div>
+              <div className="table-actions">
+                <button
+                  type="button"
+                  className={`secondary ${analyticsTab === "kpi" ? "is-active" : ""}`}
+                  onClick={() => setAnalyticsTab("kpi")}
+                >
+                  KPI Dashboard
+                </button>
+                <button
+                  type="button"
+                  className={`secondary ${analyticsTab === "source" ? "is-active" : ""}`}
+                  onClick={() => setAnalyticsTab("source")}
+                >
+                  Source Comparison
+                </button>
+                <button
+                  type="button"
+                  className={`secondary ${analyticsTab === "station" ? "is-active" : ""}`}
+                  onClick={() => setAnalyticsTab("station")}
+                >
+                  Station Intelligence
+                </button>
+              </div>
+            </div>
+
+            {analyticsLoading ? (
+              <p>Loading analytics...</p>
+            ) : analyticsError ? (
+              <p className="notice error">{analyticsError}</p>
+            ) : !analyticsData ? (
+              <p className="notice">Run route planning once to generate analytics.</p>
+            ) : (
+              <>
+                {analyticsTab === "kpi" && (
+                  <div className="analytics-grid">
+                    {analyticsKpis.map((item, index) => (
+                      <article className="analytics-card" key={`${item.title}-${index}`}>
+                        <p className="analytics-kicker">{item.title}</p>
+                        <h3>{item.value}</h3>
+                        {String(item.description || "").trim() ? <p>{item.description}</p> : null}
+                      </article>
+                    ))}
+                  </div>
+                )}
+
+                {analyticsTab === "source" && (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Rank</th>
+                        <th>Source</th>
+                        <th>Price / MT</th>
+                        <th>Vs Cheapest</th>
+                        <th>Runs</th>
+                        <th>Total LT</th>
+                        <th>Total MT</th>
+                        <th>Avg Cost / MT</th>
+                        <th>Recommendation</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyticsSources.map((item) => (
+                        <tr key={item.source_id}>
+                          <td>{item.rank ?? "-"}</td>
+                          <td>{item.source_name || item.source_id}</td>
+                          <td>{numberFmt.format(item.price_per_mt || 0)}</td>
+                          <td>{item.vs_cheapest_per_mt ? `+${numberFmt.format(item.vs_cheapest_per_mt)}` : "0"}</td>
+                          <td>{numberFmt.format(item.runs || 0)}</td>
+                          <td>{numberFmt.format(item.total_lt || 0)}</td>
+                          <td>{numberFmt.format(item.total_mt || 0)}</td>
+                          <td>{numberFmt.format(item.avg_cost_per_mt || 0)}</td>
+                          <td>{item.recommendation || "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+
+                {analyticsTab === "station" && (
+                  <div className="analytics-grid two-col">
+                    <article className="analytics-card">
+                      <p className="analytics-kicker">Top Stations</p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Station</th>
+                            <th>Month</th>
+                            <th>Avg Daily LT</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(analyticsStationIntel.top_stations || []).length ? (
+                            (analyticsStationIntel.top_stations || []).slice(0, 10).map((item, index) => (
+                              <tr key={`${item.station_name}-${item.month}-${index}`}>
+                                <td>{item.station_name}</td>
+                                <td>{item.month}</td>
+                                <td>{numberFmt.format(item.avg_daily_sales_lt || 0)}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={3}>No monthly sales data yet. Import sales and run route plan.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </article>
+                    <article className="analytics-card">
+                      <p className="analytics-kicker">Most Volatile Stations</p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Station</th>
+                            <th>CV %</th>
+                            <th>Std Dev LT</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(analyticsStationIntel.volatile_stations || []).length ? (
+                            (analyticsStationIntel.volatile_stations || []).slice(0, 10).map((item) => (
+                              <tr key={item.station_name}>
+                                <td>{item.station_name}</td>
+                                <td>{item.cv_pct}</td>
+                                <td>{numberFmt.format(item.std_dev_lt || 0)}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={3}>No variability insights yet. Import sales and run route plan.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </article>
+                    <article className="analytics-card">
+                      <p className="analytics-kicker">Monthly Summary</p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Month</th>
+                            <th>Total Sales LT</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(analyticsStationIntel.monthly_summary || []).length ? (
+                            (analyticsStationIntel.monthly_summary || []).slice(0, 12).map((item, index) => (
+                              <tr key={`${item.month}-${index}`}>
+                                <td>{item.month}</td>
+                                <td>{numberFmt.format(item.total_sales_lt || 0)}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={2}>No monthly summary available.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </article>
+                    <article className="analytics-card">
+                      <p className="analytics-kicker">All Stations Snapshot</p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Station</th>
+                            <th>Avg Daily LT</th>
+                            <th>Demand</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(analyticsStationIntel.all_stations || []).length ? (
+                            (analyticsStationIntel.all_stations || []).slice(0, 20).map((item, index) => (
+                              <tr key={`${item.station_name}-all-${index}`}>
+                                <td>{item.station_name}</td>
+                                <td>{numberFmt.format(item.avg_daily_sales_lt || 0)}</td>
+                                <td>{item.demand_level || "-"}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={3}>No station profiles available.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </article>
+                  </div>
+                )}
+              </>
+            )}
+          </article>
+          )}
+
+          {activeView === "news" && (
+          <article className="table-wrap">
+            <div className="table-header">
+              <div>
+                <h2>LPG News Feed</h2>
+                <p className="table-sub">Click a headline to open the original article.</p>
+              </div>
+            </div>
+            {selectedNews && (
+              <article className="news-highlight">
+                <h3>{selectedNews.title}</h3>
+                <p className="table-sub">
+                  {selectedNews.source} | {formatDateTime(selectedNews.published_at)}
+                </p>
+                {selectedNews.url ? (
+                  <p className="table-sub">
+                    <a
+                      className="location-link"
+                      href={selectedNews.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open original article
+                    </a>
+                  </p>
+                ) : null}
+              </article>
+            )}
+            <table>
+              <thead>
+                <tr>
+                  <th>Headline</th>
+                  <th>Source</th>
+                  <th>Published</th>
+                </tr>
+              </thead>
+              <tbody>
+                {newsFeed.map((item) => (
+                  <tr
+                    key={item.id}
+                    className={item.id === selectedNews?.id ? "news-row-selected" : ""}
+                  >
+                    <td>
+                      <a
+                        className="location-link"
+                        href={item.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onMouseEnter={() => setSelectedNewsId(item.id)}
+                      >
+                        {item.title}
+                      </a>
+                    </td>
+                    <td>{item.source}</td>
+                    <td>{formatDateTime(item.published_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </article>
+          )}
+
           {activeView === "sources" && (
           <article className="table-wrap">
             <div className="table-header">
@@ -2252,6 +3010,19 @@ function App() {
                   />
                 </label>
                   <label>
+                    State
+                    <select
+                      value={truckForm.state}
+                      onChange={(event) => updateTruckForm("state", event.target.value)}
+                    >
+                      <option value="travelling">travelling</option>
+                      <option value="atStation">atStation</option>
+                      <option value="atSource">atSource</option>
+                      <option value="atMaintenance">atMaintenance</option>
+                    </select>
+                  </label>
+                  {truckForm.state === "atStation" && (
+                  <label>
                     Station
                     <input
                       list="truck-station-options"
@@ -2263,10 +3034,30 @@ function App() {
                       required
                     />
                   </label>
+                  )}
+                  {truckForm.state === "atSource" && (
+                  <label>
+                    Source
+                    <input
+                      list="truck-source-options"
+                      value={truckForm.source}
+                      onChange={(event) =>
+                        updateTruckForm("source", event.target.value)
+                      }
+                      placeholder="Source name"
+                      required
+                    />
+                  </label>
+                  )}
                 </div>
                 <datalist id="truck-station-options">
                   {stations.map((station) => (
                     <option key={station._id} value={station.station} />
+                  ))}
+                </datalist>
+                <datalist id="truck-source-options">
+                  {sources.map((source) => (
+                    <option key={source._id} value={source.source_name} />
                   ))}
                 </datalist>
                 <div className="form-actions">
@@ -2297,6 +3088,8 @@ function App() {
                     <th>Truck ID</th>
                     <th>Capacity (MT)</th>
                     <th>Station</th>
+                    <th>Source</th>
+                    <th>State</th>
                     <th>Location</th>
                     <th>Actions</th>
                 </tr>
@@ -2306,24 +3099,27 @@ function App() {
                   const state = resolveTruckState(item);
                   const stationCoords =
                     state === "atStation" ? getStationCoordinates(item.station) : null;
+                  const sourceCoords =
+                    state === "atSource" ? getSourceCoordinates(item.source) : null;
                   const coords =
-                    stationCoords ?? (state === "atStation"
+                    stationCoords ??
+                    sourceCoords ??
+                    ((state === "atStation" || state === "atSource")
                       ? { lat: item.lat, lng: item.lon }
                       : null);
                   const mapUrl = toMapUrl(coords);
-                  const locationLabel =
-                    state === "atStation"
-                      ? coords
-                        ? `${coords.lat}, ${coords.lng ?? coords.lon}`
-                        : "-"
-                      : state;
+                  const locationLabel = coords
+                    ? `${coords.lat}, ${coords.lng ?? coords.lon}`
+                    : "-";
                   return (
                     <tr key={item._id}>
                       <td>{item.truck_id}</td>
                       <td>{formatCapacity(item.type) || "-"}</td>
-                      <td>{item.station}</td>
+                      <td>{item.station || "-"}</td>
+                      <td>{item.source || "-"}</td>
+                      <td>{state}</td>
                       <td>
-                        {state === "atStation" && mapUrl ? (
+                        {(state === "atStation" || state === "atSource") && mapUrl ? (
                           <a
                             className="location-link"
                             href={mapUrl}
@@ -2807,7 +3603,7 @@ function App() {
                     placeholder="T01"
                     required
                   />
-                </label>
+                  </label>
                   <label>
                     Capacity (MT)
                     <input
@@ -2819,22 +3615,55 @@ function App() {
                       required
                     />
                   </label>
-                <label>
-                  Station
-                  <input
-                    list="truck-edit-station-options"
-                    value={truckForm.station}
-                    onChange={(event) =>
-                      updateTruckForm("station", event.target.value)
-                    }
-                    placeholder="Station name"
-                    required
-                  />
-                </label>
+                  <label>
+                    State
+                    <select
+                      value={truckForm.state}
+                      onChange={(event) => updateTruckForm("state", event.target.value)}
+                    >
+                      <option value="travelling">travelling</option>
+                      <option value="atStation">atStation</option>
+                      <option value="atSource">atSource</option>
+                      <option value="atMaintenance">atMaintenance</option>
+                    </select>
+                  </label>
+                {truckForm.state === "atStation" && (
+                  <label>
+                    Station
+                    <input
+                      list="truck-edit-station-options"
+                      value={truckForm.station}
+                      onChange={(event) =>
+                        updateTruckForm("station", event.target.value)
+                      }
+                      placeholder="Station name"
+                      required
+                    />
+                  </label>
+                )}
+                {truckForm.state === "atSource" && (
+                  <label>
+                    Source
+                    <input
+                      list="truck-edit-source-options"
+                      value={truckForm.source}
+                      onChange={(event) =>
+                        updateTruckForm("source", event.target.value)
+                      }
+                      placeholder="Source name"
+                      required
+                    />
+                  </label>
+                )}
               </div>
               <datalist id="truck-edit-station-options">
                 {stations.map((station) => (
                   <option key={station._id} value={station.station} />
+                ))}
+              </datalist>
+              <datalist id="truck-edit-source-options">
+                {sources.map((source) => (
+                  <option key={source._id} value={source.source_name} />
                 ))}
               </datalist>
               <div className="form-actions">
