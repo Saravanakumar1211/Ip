@@ -31,7 +31,9 @@ const resolveDataFile = (filename) => {
 
 const SOURCES_FILE = resolveDataFile("sources.xlsx");
 const STATIONS_FILE = resolveDataFile("clean_stationss.xlsx");
-const TRUCKS_FILE = resolveDataFile("truck_positions.json");
+const TRUCKS_FILE = fs.existsSync(path.join(DATA_DIR, "truck_positions.json"))
+  ? path.join(DATA_DIR, "truck_positions.json")
+  : path.join(PYTHON_DIR, "truck_positions.json");
 const SALES_FILE = path.join(DATA_DIR, "sales_data.xlsx");
 
 const parseCoordinates = (value) => {
@@ -231,16 +233,13 @@ const importTrucks = async () => {
     return { matched: 0, modified: 0, upserted: 0 };
   }
 
-  const [sourceDocs, stationDocs] = await Promise.all([
-    Source.find({}, { source_id: 1, source_name: 1, coordinates: 1 }).lean(),
-    Station.find({}, { station: 1, coordinates: 1 }).lean()
-  ]);
+  const sourceDocs = await Source.find(
+    {},
+    { source_id: 1, source_name: 1, coordinates: 1 }
+  ).lean();
 
   const sourceByName = new Map(
     sourceDocs.map((item) => [normalizeName(item.source_name), item])
-  );
-  const stationByName = new Map(
-    stationDocs.map((item) => [normalizeName(item.station), item])
   );
 
   const raw = JSON.parse(fs.readFileSync(TRUCKS_FILE, "utf-8"));
@@ -248,8 +247,10 @@ const importTrucks = async () => {
 
   for (const [truckId, data] of Object.entries(raw || {})) {
     const type = String(data?.type || "").trim();
-    const stationCandidate = normalizeName(data?.station || data?.station_name || "");
-    const sourceCandidate = normalizeName(data?.source || data?.source_name || "");
+    const sourceCandidateRaw = String(
+      data?.source || data?.source_name || data?.station || data?.station_name || ""
+    ).trim();
+    const sourceCandidate = normalizeName(sourceCandidateRaw);
     const lat = toNumber(data?.lat);
     const lon = toNumber(data?.lon);
 
@@ -257,34 +258,19 @@ const importTrucks = async () => {
       continue;
     }
 
-    const sourceMatch =
-      sourceByName.get(sourceCandidate) ||
-      sourceByName.get(stationCandidate) ||
-      null;
-    const stationMatch = stationByName.get(stationCandidate) || null;
-
-    const isAtSource = Boolean(sourceMatch);
-    const isAtStation = !isAtSource && Boolean(stationMatch);
-    const state = isAtSource ? "atSource" : isAtStation ? "atStation" : "travelling";
-
-    const sourceName = isAtSource ? sourceMatch.source_name : null;
-    const sourceId = isAtSource ? sourceMatch.source_id : null;
-    const stationName = isAtStation ? stationMatch.station : null;
+    const sourceMatch = sourceByName.get(sourceCandidate) || null;
+    const sourceName = sourceMatch?.source_name || sourceCandidateRaw || null;
+    const sourceId = sourceMatch?.source_id || null;
 
     const coordLat =
       lat ??
-      (isAtSource
-        ? sourceMatch.coordinates?.lat
-        : isAtStation
-          ? stationMatch.coordinates?.lat
-          : null);
+      sourceMatch?.coordinates?.lat ??
+      null;
     const coordLon =
       lon ??
-      (isAtSource
-        ? sourceMatch.coordinates?.lng ?? sourceMatch.coordinates?.lon
-        : isAtStation
-          ? stationMatch.coordinates?.lng ?? stationMatch.coordinates?.lon
-          : null);
+      sourceMatch?.coordinates?.lng ??
+      sourceMatch?.coordinates?.lon ??
+      null;
 
     operations.push({
       updateOne: {
@@ -292,13 +278,14 @@ const importTrucks = async () => {
         update: {
           $set: {
             truck_id: truckId,
-            station: stationName,
+            station: null,
             source: sourceName,
             source_id: sourceId,
             lat: coordLat,
             lon: coordLon,
             type,
-            state
+            state: "atSource",
+            maintenance_station: null
           }
         },
         upsert: true

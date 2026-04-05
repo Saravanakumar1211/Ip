@@ -132,49 +132,108 @@ const buildStationPayload = (body) => {
   };
 };
 
-const buildTruckPayload = (body) => {
+const escapeRegex = (value) =>
+  String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const deriveTruckState = ({ station, source, maintenanceStation }) => {
+  if (source) return "atSource";
+  if (station) return "atStation";
+  if (maintenanceStation) return "atMaintenance";
+  return "travelling";
+};
+
+const findStationByName = async (stationName) => {
+  if (!stationName) return null;
+  return Station.findOne({
+    station: { $regex: `^${escapeRegex(stationName)}$`, $options: "i" }
+  })
+    .select("station coordinates")
+    .lean();
+};
+
+const findSource = async ({ sourceName, sourceId }) => {
+  if (sourceId) {
+    const byId = await Source.findOne({
+      source_id: { $regex: `^${escapeRegex(sourceId)}$`, $options: "i" }
+    })
+      .select("source_id source_name coordinates")
+      .lean();
+    if (byId) return byId;
+  }
+  if (!sourceName) return null;
+  return Source.findOne({
+    source_name: { $regex: `^${escapeRegex(sourceName)}$`, $options: "i" }
+  })
+    .select("source_id source_name coordinates")
+    .lean();
+};
+
+const buildTruckPayload = async (body, { existingTruck = null } = {}) => {
   const truckId = String(body.truck_id || "").trim();
-  const station = String(body.station || "").trim();
-  const source = String(body.source || body.source_name || "").trim();
-  const sourceId = String(body.source_id || "").trim();
+  const stationInput = String(body.station || "").trim();
+  const sourceInput = String(body.source || body.source_name || "").trim();
+  const sourceIdInput = String(body.source_id || "").trim();
   const type = String(body.type || "").trim();
-  const lat = parseNumber(body.lat);
-  const lon = parseNumber(body.lon);
-  const stateRaw = String(body.state || "").trim().toLowerCase();
-  const normalizedStateMap = {
-    atstation: "atStation",
-    atsource: "atSource",
-    atmaintenance: "atMaintenance",
-    maintenance: "atMaintenance",
-    travelling: "travelling",
-    traveling: "travelling"
-  };
-  const explicitState = normalizedStateMap[stateRaw] || null;
-  const state =
-    explicitState ||
-    (station ? "atStation" : source ? "atSource" : "travelling");
+  let lat = parseNumber(body.lat);
+  let lon = parseNumber(body.lon);
   const errors = [];
 
   if (!truckId) errors.push("truck_id");
   if (!type) errors.push("type");
-  if (state === "atStation") {
-    if (!station) errors.push("station");
-    if (lat === null || lon === null) errors.push("coordinates");
+  if (stationInput && (sourceInput || sourceIdInput)) {
+    errors.push("station_or_source");
   }
-  if (state === "atSource") {
-    if (!source) errors.push("source");
-    if (lat === null || lon === null) errors.push("coordinates");
+
+  let stationDoc = null;
+  let sourceDoc = null;
+
+  if (stationInput) {
+    stationDoc = await findStationByName(stationInput);
+    if (!stationDoc) {
+      errors.push("station");
+    } else if (lat === null || lon === null) {
+      lat = parseNumber(stationDoc.coordinates?.lat);
+      lon = parseNumber(stationDoc.coordinates?.lng ?? stationDoc.coordinates?.lon);
+    }
+  }
+
+  if (sourceInput || sourceIdInput) {
+    sourceDoc = await findSource({ sourceName: sourceInput, sourceId: sourceIdInput });
+    if (!sourceDoc) {
+      errors.push("source");
+    } else if (lat === null || lon === null) {
+      lat = parseNumber(sourceDoc.coordinates?.lat);
+      lon = parseNumber(sourceDoc.coordinates?.lng ?? sourceDoc.coordinates?.lon);
+    }
+  }
+
+  const stationName = stationDoc?.station || "";
+  const sourceName = sourceDoc?.source_name || "";
+  const sourceId = sourceDoc?.source_id || "";
+  const existingMaintenanceStation = String(existingTruck?.maintenance_station || "").trim();
+  const maintenanceStation =
+    stationName || sourceName ? "" : existingMaintenanceStation;
+
+  const state = deriveTruckState({
+    station: stationName,
+    source: sourceName,
+    maintenanceStation
+  });
+
+  if ((state === "atStation" || state === "atSource") && (lat === null || lon === null)) {
+    errors.push("coordinates");
   }
 
   return {
     payload: {
       truck_id: truckId,
-      station: state === "atStation" ? station : null,
-      source: state === "atSource" ? source : null,
+      station: state === "atStation" ? stationName : null,
+      source: state === "atSource" ? sourceName : null,
       source_id: state === "atSource" ? sourceId || null : null,
       type,
       lat: state === "atStation" || state === "atSource" ? lat : null,
       lon: state === "atStation" || state === "atSource" ? lon : null,
+      maintenance_station: state === "atMaintenance" ? maintenanceStation : null,
       state
     },
     errors
@@ -424,7 +483,7 @@ router.get("/trucks", async (_req, res) => {
 });
 
 router.post("/trucks", async (req, res) => {
-  const { payload, errors } = buildTruckPayload(req.body);
+  const { payload, errors } = await buildTruckPayload(req.body);
   if (errors.length) {
     return res
       .status(400)
@@ -440,7 +499,25 @@ router.post("/trucks", async (req, res) => {
 });
 
 router.patch("/trucks/:id", async (req, res) => {
-  const { payload, errors } = buildTruckPayload(req.body);
+  let existing = null;
+  try {
+    existing = await Truck.findById(req.params.id);
+  } catch (error) {
+    if (error?.name === "CastError") {
+      return res.status(400).json({ message: "Invalid truck id." });
+    }
+    return res
+      .status(500)
+      .json({ message: "Failed to load truck.", error: error.message });
+  }
+
+  if (!existing) {
+    return res.status(404).json({ message: "Truck not found." });
+  }
+
+  const { payload, errors } = await buildTruckPayload(req.body, {
+    existingTruck: existing
+  });
   if (errors.length) {
     return res
       .status(400)
@@ -448,18 +525,10 @@ router.patch("/trucks/:id", async (req, res) => {
   }
 
   try {
-    const updated = await Truck.findByIdAndUpdate(req.params.id, payload, {
-      new: true,
-      runValidators: true
-    });
-    if (!updated) {
-      return res.status(404).json({ message: "Truck not found." });
-    }
-    return res.json(updated);
+    existing.set(payload);
+    await existing.save();
+    return res.json(existing);
   } catch (error) {
-    if (error?.name === "CastError") {
-      return res.status(400).json({ message: "Invalid truck id." });
-    }
     return handleDuplicateError(error, res, "truck");
   }
 });

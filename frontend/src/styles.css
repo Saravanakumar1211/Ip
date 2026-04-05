@@ -304,21 +304,31 @@ button.danger {
   text-align: left;
   font-size: 15px;
   font-weight: 700;
+  padding: 0;
+}
+
+.news-ticker-viewport {
+  display: block;
+  overflow: hidden;
+  width: 100%;
   padding: 10px 12px;
 }
 
 .news-ticker-track {
   display: inline-block;
   white-space: nowrap;
-  animation: ticker-slide 18s linear infinite;
+  will-change: transform;
+  animation-name: ticker-slide;
+  animation-timing-function: linear;
+  animation-iteration-count: 1;
 }
 
 @keyframes ticker-slide {
   0% {
-    transform: translateX(0);
+    transform: translateX(var(--ticker-start, 100%));
   }
   100% {
-    transform: translateX(-40%);
+    transform: translateX(var(--ticker-end, -100%));
   }
 }
 

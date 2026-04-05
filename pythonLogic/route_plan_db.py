@@ -245,24 +245,37 @@ def load_from_db(db):
         stations.append(row)
         station_by_name[normalize_name(station_name)] = row
 
+    latest_truck_plan = db["truckPlanning"].find_one({}, sort=[("created_at", -1)])
+    planned_positions = {}
+    if latest_truck_plan:
+        for position in latest_truck_plan.get("truck_positions", []):
+            truck_id = str(position.get("truck_id") or "").strip()
+            if truck_id:
+                planned_positions[truck_id] = position
+
     trucks = []
     for truck in db["truck"].find({}).sort("truck_id", 1):
         truck_id = str(truck.get("truck_id") or "").strip()
         if not truck_id:
             continue
 
-        state = str(truck.get("state") or "").strip()
+        planned = planned_positions.get(truck_id, {})
+        maintenance_station = str(truck.get("maintenance_station") or "").strip()
+
+        state = str(planned.get("state") or truck.get("state") or "").strip()
+        source_name = str(planned.get("source") or truck.get("source") or "").strip()
+        source_id = str(planned.get("source_id") or truck.get("source_id") or "").strip()
+        station_name = str(planned.get("station") or truck.get("station") or "").strip()
+
         if state not in ("atSource", "atStation", "atMaintenance", "travelling"):
-            if truck.get("source"):
+            if source_name:
                 state = "atSource"
-            elif truck.get("station"):
+            elif station_name:
                 state = "atStation"
+            elif maintenance_station:
+                state = "atMaintenance"
             else:
                 state = "travelling"
-
-        source_name = str(truck.get("source") or "").strip()
-        source_id = str(truck.get("source_id") or "").strip()
-        station_name = str(truck.get("station") or "").strip()
 
         source_match = None
         if source_name:
@@ -275,8 +288,11 @@ def load_from_db(db):
 
         station_match = station_by_name.get(normalize_name(station_name)) if station_name else None
 
-        lat = to_float(truck.get("lat"), None)
-        lon = to_float(truck.get("lon"), None)
+        lat = to_float(planned.get("lat", planned.get("parked_lat")), None)
+        lon = to_float(planned.get("lon", planned.get("parked_lon")), None)
+        if lat is None or lon is None:
+            lat = to_float(truck.get("lat"), None)
+            lon = to_float(truck.get("lon"), None)
         if (lat is None or lon is None) and source_match and state == "atSource":
             lat, lon = source_match["source_lat"], source_match["source_lon"]
         elif (lat is None or lon is None) and station_match and state == "atStation":
@@ -289,7 +305,7 @@ def load_from_db(db):
         elif state == "atStation":
             parked_label = station_name or (station_match["station"] if station_match else None)
         elif state == "atMaintenance":
-            parked_label = str(truck.get("maintenance_station") or station_name or "Maintenance").strip() or "Maintenance"
+            parked_label = maintenance_station or station_name or "Maintenance"
         else:
             parked_label = station_name or source_name or "Travelling"
 
@@ -1015,34 +1031,6 @@ def write_plan(db, delivery_plans, fleet_status, trucks, unserved, stations_df, 
         "meta": {"source": "pythonLogic/logic3.py"},
     }
     db["analyticsDashboard"].insert_one(analytics_doc)
-
-    updates = []
-    for truck in trucks:
-        station = truck.get("parked_station") if truck.get("state") == "atStation" else None
-        source = truck.get("parked_source") if truck.get("state") == "atSource" else None
-        source_id = truck.get("parked_source_id") if truck.get("state") == "atSource" else None
-        lat = truck.get("parked_lat") if truck.get("state") in ("atStation", "atSource") else truck.get("parked_lat")
-        lon = truck.get("parked_lon") if truck.get("state") in ("atStation", "atSource") else truck.get("parked_lon")
-
-        updates.append(
-            UpdateOne(
-                {"truck_id": truck["truck_id"]},
-                {
-                    "$set": {
-                        "station": station,
-                        "source": source,
-                        "source_id": source_id,
-                        "lat": lat,
-                        "lon": lon,
-                        "state": truck.get("state") or "travelling",
-                    }
-                },
-            )
-        )
-
-    if updates:
-        db["truck"].bulk_write(updates, ordered=False)
-
 
 def main():
     client = MongoClient(MONGO_URI)

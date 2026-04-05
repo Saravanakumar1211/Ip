@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import logoUrl from "../assets/Logo.avif";
 
@@ -36,6 +36,7 @@ const emptyTruckForm = {
   type: "",
   station: "",
   source: "",
+  maintenance_station: "",
   state: "travelling",
   lat: "",
   lon: ""
@@ -127,6 +128,17 @@ const computeStockFields = ({ capacity, deadStock, usable, changedField }) => {
   return { deadStock, usable };
 };
 
+const computeAutoTruckState = ({ station, source, maintenanceStation }) => {
+  const hasStation = Boolean(String(station || "").trim());
+  const hasSource = Boolean(String(source || "").trim());
+  const hasMaintenance = Boolean(String(maintenanceStation || "").trim());
+
+  if (hasSource) return "atSource";
+  if (hasStation) return "atStation";
+  if (hasMaintenance) return "atMaintenance";
+  return "travelling";
+};
+
 function App() {
   const [auth, setAuth] = useState({ token: "", role: "", name: "", station: "" });
   const [form, setForm] = useState(emptyForm);
@@ -203,6 +215,14 @@ function App() {
   const [newsError, setNewsError] = useState("");
   const [newsTickerIndex, setNewsTickerIndex] = useState(0);
   const [selectedNewsId, setSelectedNewsId] = useState("");
+  const [tickerAnimationKey, setTickerAnimationKey] = useState(0);
+  const [tickerAnimation, setTickerAnimation] = useState({
+    startPx: 0,
+    endPx: -600,
+    durationSec: 14
+  });
+  const tickerViewportRef = useRef(null);
+  const tickerTrackRef = useRef(null);
 
   const [analyticsData, setAnalyticsData] = useState(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
@@ -382,6 +402,10 @@ function App() {
     setTruckForm((prev) => {
       const next = { ...prev, [field]: value };
       if (field === "station") {
+        if (String(value || "").trim()) {
+          next.source = "";
+          next.maintenance_station = "";
+        }
         const match = stations.find(
           (item) =>
             String(item.station || "").trim().toLowerCase() ===
@@ -393,33 +417,28 @@ function App() {
         }
       }
       if (field === "source") {
+        if (String(value || "").trim()) {
+          next.station = "";
+          next.maintenance_station = "";
+        }
+        const normalized = String(value || "").trim().toLowerCase();
         const match = sources.find(
-          (item) =>
-            String(item.source_name || "").trim().toLowerCase() ===
-            String(value || "").trim().toLowerCase()
+          (item) => {
+            const sourceName = String(item.source_name || "").trim().toLowerCase();
+            const sourceId = String(item.source_id || "").trim().toLowerCase();
+            return normalized && (sourceName === normalized || sourceId === normalized);
+          }
         );
         if (match?.coordinates) {
           next.lat = match.coordinates.lat ?? "";
           next.lon = match.coordinates.lng ?? match.coordinates.lon ?? "";
-          next.state = "atSource";
         }
       }
-      if (field === "state") {
-        if (value === "travelling") {
-          next.station = "";
-          next.source = "";
-        }
-        if (value === "atStation") {
-          next.source = "";
-        }
-        if (value === "atSource") {
-          next.station = "";
-        }
-        if (value === "atMaintenance") {
-          next.station = "";
-          next.source = "";
-        }
-      }
+      next.state = computeAutoTruckState({
+        station: next.station,
+        source: next.source,
+        maintenanceStation: next.maintenance_station
+      });
       return next;
     });
   };
@@ -470,6 +489,7 @@ function App() {
     ) {
       return state;
     }
+    if (truck?.maintenance_station) return "atMaintenance";
     if (truck?.source) return "atSource";
     return truck?.station ? "atStation" : "travelling";
   };
@@ -745,42 +765,67 @@ function App() {
     const errors = [];
     const truckId = truckForm.truck_id.trim();
     const type = truckForm.type.trim();
-    const station = truckForm.station.trim();
-    const source = truckForm.source.trim();
-    const state = truckForm.state;
+    const stationInput = truckForm.station.trim();
+    const sourceInput = truckForm.source.trim();
     let lat = parseNumber(truckForm.lat);
     let lon = parseNumber(truckForm.lon);
+    let station = stationInput;
+    let source = sourceInput;
+    let sourceId = "";
+
+    if (stationInput && sourceInput) {
+      errors.push("either station or source");
+    }
 
     if (!truckId) errors.push("truck id");
     if (!type) errors.push("capacity in mt");
-    if (state === "atStation") {
-      if (!station) errors.push("station");
+    if (stationInput) {
+      const match = stations.find(
+        (item) =>
+          String(item.station || "").trim().toLowerCase() ===
+          stationInput.trim().toLowerCase()
+      );
+      if (!match) {
+        errors.push("station");
+      } else {
+        station = match.station || stationInput;
+      }
       if (lat === null || lon === null) {
-        const match = stations.find(
-          (item) =>
-            String(item.station || "").trim().toLowerCase() ===
-            station.trim().toLowerCase()
-        );
         if (match?.coordinates) {
           lat = match.coordinates.lat;
           lon = match.coordinates.lng ?? match.coordinates.lon;
         }
       }
     }
-    if (state === "atSource") {
-      if (!source) errors.push("source");
+    if (sourceInput) {
+      const sourceLookup = source.trim().toLowerCase();
+      const match = sources.find(
+        (item) => {
+          const sourceName = String(item.source_name || "").trim().toLowerCase();
+          const sourceIdValue = String(item.source_id || "").trim().toLowerCase();
+          return sourceLookup && (sourceName === sourceLookup || sourceIdValue === sourceLookup);
+        }
+      );
+      if (!match) {
+        errors.push("source");
+      } else {
+        source = match.source_name || sourceInput;
+        sourceId = match.source_id || "";
+      }
       if (lat === null || lon === null) {
-        const match = sources.find(
-          (item) =>
-            String(item.source_name || "").trim().toLowerCase() ===
-            source.trim().toLowerCase()
-        );
         if (match?.coordinates) {
           lat = match.coordinates.lat;
           lon = match.coordinates.lng ?? match.coordinates.lon;
         }
       }
     }
+
+    const state = computeAutoTruckState({
+      station,
+      source,
+      maintenanceStation: truckForm.maintenance_station
+    });
+
     if ((state === "atStation" || state === "atSource") && (lat === null || lon === null)) {
       errors.push("coordinates");
     }
@@ -791,6 +836,7 @@ function App() {
         type,
         station: state === "atStation" ? station : "",
         source: state === "atSource" ? source : "",
+        source_id: state === "atSource" ? sourceId : "",
         lat: state === "atStation" || state === "atSource" ? lat : null,
         lon: state === "atStation" || state === "atSource" ? lon : null,
         state
@@ -1199,14 +1245,37 @@ function App() {
   }, [auth.token, auth.role, activeView]);
 
   useEffect(() => {
-    if (newsFeed.length <= 1) {
+    if (!tickerNews) {
       return undefined;
     }
-    const timer = window.setInterval(() => {
+    const refreshTickerMetrics = () => {
+      const viewportWidth = tickerViewportRef.current?.offsetWidth || 0;
+      const trackWidth = tickerTrackRef.current?.scrollWidth || 0;
+      if (!viewportWidth || !trackWidth) return;
+
+      const distance = viewportWidth + trackWidth;
+      const durationSec = Math.max(12, distance / 90);
+      setTickerAnimation({
+        startPx: viewportWidth,
+        endPx: -trackWidth,
+        durationSec
+      });
+    };
+
+    const frameId = window.requestAnimationFrame(refreshTickerMetrics);
+    window.addEventListener("resize", refreshTickerMetrics);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      window.removeEventListener("resize", refreshTickerMetrics);
+    };
+  }, [tickerNews, tickerAnimationKey]);
+
+  const handleTickerAnimationEnd = () => {
+    if (newsFeed.length > 1) {
       setNewsTickerIndex((prev) => (prev + 1) % newsFeed.length);
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [newsFeed]);
+    }
+    setTickerAnimationKey((prev) => prev + 1);
+  };
 
   const handleSourceSubmit = async (event) => {
     event.preventDefault();
@@ -1421,7 +1490,12 @@ function App() {
       type: formatCapacity(item.type || ""),
       station: item.station || "",
       source: item.source || "",
-      state: resolveTruckState(item),
+      maintenance_station: item.maintenance_station || "",
+      state: computeAutoTruckState({
+        station: item.station,
+        source: item.source,
+        maintenanceStation: item.maintenance_station
+      }),
       lat: item.lat ?? "",
       lon: item.lon ?? ""
     });
@@ -1624,8 +1698,20 @@ function App() {
               className="news-ticker"
               onClick={() => openNewsView(tickerNews.id)}
             >
-              <span className="news-ticker-track">
-                {tickerNews.title} - {tickerNews.source}
+              <span className="news-ticker-viewport" ref={tickerViewportRef}>
+                <span
+                  key={`${tickerNews.id}-${tickerAnimationKey}`}
+                  ref={tickerTrackRef}
+                  className="news-ticker-track"
+                  style={{
+                    "--ticker-start": `${tickerAnimation.startPx}px`,
+                    "--ticker-end": `${tickerAnimation.endPx}px`,
+                    animationDuration: `${tickerAnimation.durationSec}s`
+                  }}
+                  onAnimationEnd={handleTickerAnimationEnd}
+                >
+                  {tickerNews.title} - {tickerNews.source}
+                </span>
               </span>
             </button>
           ) : (
@@ -1978,8 +2064,20 @@ function App() {
             className="news-ticker"
             onClick={() => openNewsView(tickerNews.id)}
           >
-            <span className="news-ticker-track">
-              {tickerNews.title} - {tickerNews.source}
+            <span className="news-ticker-viewport" ref={tickerViewportRef}>
+              <span
+                key={`${tickerNews.id}-${tickerAnimationKey}`}
+                ref={tickerTrackRef}
+                className="news-ticker-track"
+                style={{
+                  "--ticker-start": `${tickerAnimation.startPx}px`,
+                  "--ticker-end": `${tickerAnimation.endPx}px`,
+                  animationDuration: `${tickerAnimation.durationSec}s`
+                }}
+                onAnimationEnd={handleTickerAnimationEnd}
+              >
+                {tickerNews.title} - {tickerNews.source}
+              </span>
             </span>
           </button>
         ) : (
@@ -2711,7 +2809,7 @@ function App() {
                 <tr>
                   <th>Source Id</th>
                   <th>Source Name</th>
-                  <th>Location</th>
+                  <th>ViewMap</th>
                   <th>Price / MT Ex Terminal</th>
                   <th>Actions</th>
                 </tr>
@@ -2731,7 +2829,7 @@ function App() {
                             target="_blank"
                             rel="noreferrer"
                           >
-                            {item.coordinates?.lat}, {item.coordinates?.lng}
+                            View Map
                           </a>
                         ) : (
                           "-"
@@ -2899,7 +2997,7 @@ function App() {
               <thead>
                 <tr>
                   <th>Station</th>
-                  <th>Location</th>
+                  <th>ViewMap</th>
                   <th>Capacity In Lt</th>
                   <th>Dead Stock In Lt</th>
                   <th>Usable Lt</th>
@@ -2921,7 +3019,7 @@ function App() {
                             target="_blank"
                             rel="noreferrer"
                           >
-                            {item.coordinates?.lat}, {item.coordinates?.lng}
+                            View Map
                           </a>
                         ) : (
                           "-"
@@ -3010,18 +3108,9 @@ function App() {
                   />
                 </label>
                   <label>
-                    State
-                    <select
-                      value={truckForm.state}
-                      onChange={(event) => updateTruckForm("state", event.target.value)}
-                    >
-                      <option value="travelling">travelling</option>
-                      <option value="atStation">atStation</option>
-                      <option value="atSource">atSource</option>
-                      <option value="atMaintenance">atMaintenance</option>
-                    </select>
+                    State (Auto)
+                    <input value={truckForm.state} readOnly />
                   </label>
-                  {truckForm.state === "atStation" && (
                   <label>
                     Station
                     <input
@@ -3031,11 +3120,8 @@ function App() {
                         updateTruckForm("station", event.target.value)
                       }
                       placeholder="Station name"
-                      required
                     />
                   </label>
-                  )}
-                  {truckForm.state === "atSource" && (
                   <label>
                     Source
                     <input
@@ -3045,10 +3131,8 @@ function App() {
                         updateTruckForm("source", event.target.value)
                       }
                       placeholder="Source name"
-                      required
                     />
                   </label>
-                  )}
                 </div>
                 <datalist id="truck-station-options">
                   {stations.map((station) => (
@@ -3090,7 +3174,7 @@ function App() {
                     <th>Station</th>
                     <th>Source</th>
                     <th>State</th>
-                    <th>Location</th>
+                    <th>ViewMap</th>
                     <th>Actions</th>
                 </tr>
               </thead>
@@ -3104,13 +3188,8 @@ function App() {
                   const coords =
                     stationCoords ??
                     sourceCoords ??
-                    ((state === "atStation" || state === "atSource")
-                      ? { lat: item.lat, lng: item.lon }
-                      : null);
+                    { lat: item.lat, lng: item.lon };
                   const mapUrl = toMapUrl(coords);
-                  const locationLabel = coords
-                    ? `${coords.lat}, ${coords.lng ?? coords.lon}`
-                    : "-";
                   return (
                     <tr key={item._id}>
                       <td>{item.truck_id}</td>
@@ -3119,17 +3198,17 @@ function App() {
                       <td>{item.source || "-"}</td>
                       <td>{state}</td>
                       <td>
-                        {(state === "atStation" || state === "atSource") && mapUrl ? (
+                        {mapUrl ? (
                           <a
                             className="location-link"
                             href={mapUrl}
                             target="_blank"
                             rel="noreferrer"
                           >
-                            {locationLabel}
+                            View Map
                           </a>
                         ) : (
-                          locationLabel || "-"
+                          "-"
                         )}
                       </td>
                       <td>
@@ -3616,18 +3695,9 @@ function App() {
                     />
                   </label>
                   <label>
-                    State
-                    <select
-                      value={truckForm.state}
-                      onChange={(event) => updateTruckForm("state", event.target.value)}
-                    >
-                      <option value="travelling">travelling</option>
-                      <option value="atStation">atStation</option>
-                      <option value="atSource">atSource</option>
-                      <option value="atMaintenance">atMaintenance</option>
-                    </select>
+                    State (Auto)
+                    <input value={truckForm.state} readOnly />
                   </label>
-                {truckForm.state === "atStation" && (
                   <label>
                     Station
                     <input
@@ -3637,11 +3707,8 @@ function App() {
                         updateTruckForm("station", event.target.value)
                       }
                       placeholder="Station name"
-                      required
                     />
                   </label>
-                )}
-                {truckForm.state === "atSource" && (
                   <label>
                     Source
                     <input
@@ -3651,10 +3718,8 @@ function App() {
                         updateTruckForm("source", event.target.value)
                       }
                       placeholder="Source name"
-                      required
                     />
                   </label>
-                )}
               </div>
               <datalist id="truck-edit-station-options">
                 {stations.map((station) => (
