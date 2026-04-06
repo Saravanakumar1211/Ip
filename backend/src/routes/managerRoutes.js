@@ -4,6 +4,10 @@ import { authenticate, requireRole } from "../middleware/auth.js";
 import { Source } from "../models/source.js";
 import { Station } from "../models/station.js";
 import { Truck } from "../models/truck.js";
+import {
+  fetchStationChangeReport,
+  recordStationAttributeChange
+} from "../services/stationChangeLogService.js";
 
 const router = Router();
 
@@ -168,16 +172,47 @@ router.patch("/station", async (req, res) => {
     const sufficientFuel =
       computed.deadStock >= 0.6 * capacity ? "NO" : "YES";
 
+    const beforeStation = station.toObject();
     station.dead_stock_in_lt = computed.deadStock;
     station.usable_lt = computed.usable;
     station.sufficient_fuel = sufficientFuel;
 
     await station.save();
+    await recordStationAttributeChange({
+      beforeStation,
+      afterStation: station.toObject(),
+      actor: req.user,
+      source: "station_manager_dashboard"
+    });
     return res.json(station);
   } catch (error) {
     return res
       .status(500)
       .json({ message: "Unable to update station stock.", error: error.message });
+  }
+});
+
+router.get("/reports/station-changes", async (req, res) => {
+  try {
+    const records = await fetchStationChangeReport({
+      actorUserId: req.user?.sub,
+      actorRole: "station_manager",
+      preset: req.query.preset,
+      from: req.query.from,
+      to: req.query.to,
+      limit: 2000
+    });
+    return res.json({
+      count: records.length,
+      records
+    });
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("date")) {
+      return res.status(400).json({ message: error.message });
+    }
+    return res
+      .status(500)
+      .json({ message: "Unable to fetch station change report.", error: error.message });
   }
 });
 

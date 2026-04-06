@@ -87,6 +87,25 @@ const formatDateTime = (value) => {
   });
 };
 
+const deriveRegionFromStationName = (stationName) => {
+  const station = String(stationName || "").trim();
+  if (!station) return "";
+  const prefix = station.split("-")[0] || station;
+  return String(prefix).trim();
+};
+
+const formatReportValue = (value) => {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch (_error) {
+      return String(value);
+    }
+  }
+  return String(value);
+};
+
 const VIEW_KEYS = [
   "menu",
   "stations",
@@ -95,14 +114,27 @@ const VIEW_KEYS = [
   "deficit",
   "managers",
   "analytics",
-  "news"
+  "news",
+  "reports"
 ];
 const ANALYTICS_TABS = ["kpi", "source", "station"];
+const DEAD_STOCK_THRESHOLD = 0.6;
+const MANAGER_DEAD_STOCK_ALERT =
+  "Alert: Dead stock exceeds 60% of total capacity, Insufficient fuel.";
 
 
 const computeSufficientFuel = (capacity, deadStock) => {
   if (capacity === null || deadStock === null) return "YES";
-  return deadStock >= 0.6 * capacity ? "NO" : "YES";
+  return deadStock >= DEAD_STOCK_THRESHOLD * capacity ? "NO" : "YES";
+};
+
+const resolveManagerDeadStockAlert = (station) => {
+  const capacity = parseNumber(station?.capacity_in_lt);
+  const deadStock = parseNumber(station?.dead_stock_in_lt);
+  if (capacity === null || deadStock === null) {
+    return "";
+  }
+  return deadStock >= DEAD_STOCK_THRESHOLD * capacity ? MANAGER_DEAD_STOCK_ALERT : "";
 };
 
 const computeStockFields = ({ capacity, deadStock, usable, changedField }) => {
@@ -216,6 +248,7 @@ function App() {
   const [newsTickerIndex, setNewsTickerIndex] = useState(0);
   const [selectedNewsId, setSelectedNewsId] = useState("");
   const [tickerAnimationKey, setTickerAnimationKey] = useState(0);
+  const [tickerReady, setTickerReady] = useState(false);
   const [tickerAnimation, setTickerAnimation] = useState({
     startPx: 0,
     endPx: -600,
@@ -228,6 +261,22 @@ function App() {
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [analyticsError, setAnalyticsError] = useState("");
   const [analyticsTab, setAnalyticsTab] = useState("kpi");
+  const [adminReportSearchBy, setAdminReportSearchBy] = useState("station");
+  const [adminReportSearchTerm, setAdminReportSearchTerm] = useState("");
+  const [adminReportPreset, setAdminReportPreset] = useState("last_week");
+  const [adminReportFromDate, setAdminReportFromDate] = useState("");
+  const [adminReportToDate, setAdminReportToDate] = useState("");
+  const [adminReportRows, setAdminReportRows] = useState([]);
+  const [adminReportLoading, setAdminReportLoading] = useState(false);
+  const [adminReportError, setAdminReportError] = useState("");
+  const [adminReportGenerated, setAdminReportGenerated] = useState(false);
+  const [managerReportPreset, setManagerReportPreset] = useState("last_week");
+  const [managerReportFromDate, setManagerReportFromDate] = useState("");
+  const [managerReportToDate, setManagerReportToDate] = useState("");
+  const [managerReportRows, setManagerReportRows] = useState([]);
+  const [managerReportLoading, setManagerReportLoading] = useState(false);
+  const [managerReportError, setManagerReportError] = useState("");
+  const [managerReportGenerated, setManagerReportGenerated] = useState(false);
 
   const totals = useMemo(() => {
     const capacity = stations.reduce((sum, item) => sum + (item.capacity_in_lt || 0), 0);
@@ -258,6 +307,78 @@ function App() {
   const analyticsKpis = analyticsData?.kpi_dashboard || [];
   const analyticsSources = analyticsData?.source_comparison || [];
   const analyticsStationIntel = analyticsData?.station_intelligence || {};
+  const reportStationOptions = useMemo(
+    () =>
+      [...new Set(stations.map((item) => String(item.station || "").trim()).filter(Boolean))].sort(
+        (a, b) => a.localeCompare(b)
+      ),
+    [stations]
+  );
+  const reportRegionOptions = useMemo(
+    () =>
+      [
+        ...new Set(
+          stations
+            .map((item) => deriveRegionFromStationName(item.station))
+            .filter(Boolean)
+        )
+      ].sort((a, b) => a.localeCompare(b)),
+    [stations]
+  );
+  const adminReportSuggestions = useMemo(
+    () => (adminReportSearchBy === "region" ? reportRegionOptions : reportStationOptions),
+    [adminReportSearchBy, reportRegionOptions, reportStationOptions]
+  );
+  const adminReportFlatRows = useMemo(
+    () =>
+      (adminReportRows || []).flatMap((entry) => {
+        const base = {
+          id: entry._id,
+          station_name: entry.station_name,
+          region: entry.region,
+          actor_name: entry.actor_name,
+          actor_role: entry.actor_role,
+          created_at: entry.created_at
+        };
+        const changes = Array.isArray(entry.changes) ? entry.changes : [];
+        if (!changes.length) {
+          return [{ ...base, field: "-", before: null, after: null }];
+        }
+        return changes.map((change, index) => ({
+          ...base,
+          key: `${entry._id}-${index}`,
+          field: change.field,
+          before: change.before,
+          after: change.after
+        }));
+      }),
+    [adminReportRows]
+  );
+  const managerReportFlatRows = useMemo(
+    () =>
+      (managerReportRows || []).flatMap((entry) => {
+        const base = {
+          id: entry._id,
+          station_name: entry.station_name,
+          region: entry.region,
+          actor_name: entry.actor_name,
+          actor_role: entry.actor_role,
+          created_at: entry.created_at
+        };
+        const changes = Array.isArray(entry.changes) ? entry.changes : [];
+        if (!changes.length) {
+          return [{ ...base, field: "-", before: null, after: null }];
+        }
+        return changes.map((change, index) => ({
+          ...base,
+          key: `${entry._id}-${index}`,
+          field: change.field,
+          before: change.before,
+          after: change.after
+        }));
+      }),
+    [managerReportRows]
+  );
 
 
 
@@ -352,7 +473,6 @@ function App() {
   const clearManagerDashboardMessages = () => {
     setManagerNoticeMsg("");
     setManagerErrorMsg("");
-    setManagerAlertMsg("");
   };
 
   const updateSourceForm = (field, value) => {
@@ -926,6 +1046,22 @@ function App() {
     setAnalyticsLoading(false);
     setAnalyticsError("");
     setAnalyticsTab("kpi");
+    setAdminReportSearchBy("station");
+    setAdminReportSearchTerm("");
+    setAdminReportPreset("last_week");
+    setAdminReportFromDate("");
+    setAdminReportToDate("");
+    setAdminReportRows([]);
+    setAdminReportLoading(false);
+    setAdminReportError("");
+    setAdminReportGenerated(false);
+    setManagerReportPreset("last_week");
+    setManagerReportFromDate("");
+    setManagerReportToDate("");
+    setManagerReportRows([]);
+    setManagerReportLoading(false);
+    setManagerReportError("");
+    setManagerReportGenerated(false);
     localStorage.removeItem(STORAGE_KEY);
     localStorage.removeItem(FORM_STORAGE_KEY);
     window.history.replaceState(null, "", "#");
@@ -961,6 +1097,8 @@ function App() {
       const items = response.data?.items || [];
       setNewsFeed(items);
       setNewsTickerIndex(0);
+      setTickerReady(false);
+      setTickerAnimationKey((prev) => prev + 1);
       if (items.length && !selectedNewsId) {
         setSelectedNewsId(items[0].id);
       }
@@ -985,6 +1123,88 @@ function App() {
       );
     } finally {
       setAnalyticsLoading(false);
+    }
+  };
+
+  const buildReportDateParams = ({ preset, fromDate, toDate }) => {
+    const normalizedPreset = String(preset || "last_week").trim().toLowerCase();
+    const params = { preset: normalizedPreset };
+    if (normalizedPreset === "custom") {
+      if (!fromDate || !toDate) {
+        throw new Error("Please select both From and To dates.");
+      }
+      params.from = fromDate;
+      params.to = toDate;
+    }
+    return params;
+  };
+
+  const handleGenerateAdminReport = async () => {
+    setAdminReportLoading(true);
+    setAdminReportError("");
+    setAdminReportGenerated(false);
+
+    try {
+      const headers = { Authorization: `Bearer ${auth.token}` };
+      const params = {
+        ...buildReportDateParams({
+          preset: adminReportPreset,
+          fromDate: adminReportFromDate,
+          toDate: adminReportToDate
+        }),
+        actor_role: "station_manager"
+      };
+      const searchTerm = String(adminReportSearchTerm || "").trim();
+      if (searchTerm) {
+        if (adminReportSearchBy === "region") {
+          params.region = searchTerm;
+        } else {
+          params.station = searchTerm;
+        }
+      }
+
+      const response = await axios.get(`${API_BASE}/reports/station-changes`, {
+        headers,
+        params
+      });
+      setAdminReportRows(response.data?.records || []);
+      setAdminReportGenerated(true);
+    } catch (reportError) {
+      setAdminReportRows([]);
+      setAdminReportError(
+        reportError.response?.data?.message || reportError.message || "Unable to generate report."
+      );
+    } finally {
+      setAdminReportLoading(false);
+    }
+  };
+
+  const handleGenerateManagerReport = async () => {
+    setManagerReportLoading(true);
+    setManagerReportError("");
+    setManagerReportGenerated(false);
+
+    try {
+      const headers = { Authorization: `Bearer ${auth.token}` };
+      const params = buildReportDateParams({
+        preset: managerReportPreset,
+        fromDate: managerReportFromDate,
+        toDate: managerReportToDate
+      });
+
+      const response = await axios.get(`${API_BASE}/manager/reports/station-changes`, {
+        headers,
+        params
+      });
+      setManagerReportRows(response.data?.records || []);
+      setManagerReportGenerated(true);
+    } catch (reportError) {
+      setManagerReportRows([]);
+      setManagerReportError(
+        reportError.response?.data?.message || reportError.message || "Unable to generate report."
+      );
+    } finally {
+      setManagerReportLoading(false);
     }
   };
 
@@ -1016,6 +1236,7 @@ function App() {
         dead_stock_in_lt: station?.dead_stock_in_lt ?? "",
         usable_lt: station?.usable_lt ?? ""
       });
+      setManagerAlertMsg(resolveManagerDeadStockAlert(station));
     } catch (fetchError) {
       setManagerErrorMsg(
         fetchError.response?.data?.message || "Unable to load station overview."
@@ -1072,11 +1293,7 @@ function App() {
         usable_lt: station.usable_lt ?? ""
       });
       setManagerNoticeMsg("Stock levels updated.");
-      if (station.dead_stock_in_lt >= 0.6 * station.capacity_in_lt) {
-        setManagerAlertMsg(
-          "Alert: Dead stock exceeds 60% of total capacity. Marking station as insufficient."
-        );
-      }
+      setManagerAlertMsg(resolveManagerDeadStockAlert(station));
     } catch (saveError) {
       setManagerErrorMsg(
         saveError.response?.data?.message || "Unable to update stock."
@@ -1246,6 +1463,7 @@ function App() {
 
   useEffect(() => {
     if (!tickerNews) {
+      setTickerReady(false);
       return undefined;
     }
     const refreshTickerMetrics = () => {
@@ -1260,6 +1478,7 @@ function App() {
         endPx: -trackWidth,
         durationSec
       });
+      setTickerReady(true);
     };
 
     const frameId = window.requestAnimationFrame(refreshTickerMetrics);
@@ -1271,6 +1490,7 @@ function App() {
   }, [tickerNews, tickerAnimationKey]);
 
   const handleTickerAnimationEnd = () => {
+    setTickerReady(false);
     if (newsFeed.length > 1) {
       setNewsTickerIndex((prev) => (prev + 1) % newsFeed.length);
     }
@@ -1706,7 +1926,9 @@ function App() {
                   style={{
                     "--ticker-start": `${tickerAnimation.startPx}px`,
                     "--ticker-end": `${tickerAnimation.endPx}px`,
-                    animationDuration: `${tickerAnimation.durationSec}s`
+                    animationDuration: `${tickerAnimation.durationSec}s`,
+                    visibility: tickerReady ? "visible" : "hidden",
+                    animationPlayState: tickerReady ? "running" : "paused"
                   }}
                   onAnimationEnd={handleTickerAnimationEnd}
                 >
@@ -2003,6 +2225,95 @@ function App() {
                   </tbody>
                 </table>
               </article>
+
+              <article className="table-wrap">
+                <div className="table-header">
+                  <div>
+                    <h2>My Change Report</h2>
+                    <p className="table-sub">
+                      Generate a report of station changes made by you.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="form-panel">
+                  <div className="form-grid">
+                    <label>
+                      Date Range
+                      <select
+                        value={managerReportPreset}
+                        onChange={(event) => setManagerReportPreset(event.target.value)}
+                      >
+                        <option value="last_week">Last Week</option>
+                        <option value="last_month">Last Month</option>
+                        <option value="custom">Custom Range</option>
+                      </select>
+                    </label>
+                    {managerReportPreset === "custom" && (
+                      <>
+                        <label>
+                          From
+                          <input
+                            type="date"
+                            value={managerReportFromDate}
+                            onChange={(event) => setManagerReportFromDate(event.target.value)}
+                          />
+                        </label>
+                        <label>
+                          To
+                          <input
+                            type="date"
+                            value={managerReportToDate}
+                            onChange={(event) => setManagerReportToDate(event.target.value)}
+                          />
+                        </label>
+                      </>
+                    )}
+                  </div>
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      onClick={handleGenerateManagerReport}
+                      disabled={managerReportLoading}
+                    >
+                      {managerReportLoading ? "Generating..." : "Generate Report"}
+                    </button>
+                  </div>
+                </div>
+
+                {managerReportError && <p className="notice error">{managerReportError}</p>}
+
+                {managerReportGenerated ? (
+                  managerReportFlatRows.length ? (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Station</th>
+                          <th>Field</th>
+                          <th>Before</th>
+                          <th>After</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {managerReportFlatRows.map((row) => (
+                          <tr key={row.key || row.id}>
+                            <td>{formatDateTime(row.created_at)}</td>
+                            <td>{row.station_name || "-"}</td>
+                            <td>{row.field || "-"}</td>
+                            <td>{formatReportValue(row.before)}</td>
+                            <td>{formatReportValue(row.after)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <p className="table-sub">No records found for this date filter.</p>
+                  )
+                ) : (
+                  <p className="table-sub">Select a date filter and click Generate Report.</p>
+                )}
+              </article>
             </section>
           </>
         ) : (
@@ -2072,7 +2383,9 @@ function App() {
                 style={{
                   "--ticker-start": `${tickerAnimation.startPx}px`,
                   "--ticker-end": `${tickerAnimation.endPx}px`,
-                  animationDuration: `${tickerAnimation.durationSec}s`
+                  animationDuration: `${tickerAnimation.durationSec}s`,
+                  visibility: tickerReady ? "visible" : "hidden",
+                  animationPlayState: tickerReady ? "running" : "paused"
                 }}
                 onAnimationEnd={handleTickerAnimationEnd}
               >
@@ -2413,6 +2726,14 @@ function App() {
           <button
             type="button"
             className="menu-item"
+            onClick={() => navigateView("reports")}
+          >
+            <h3>Reports Dashboard</h3>
+            <p>Generate station change reports by station, region, and date range.</p>
+          </button>
+          <button
+            type="button"
+            className="menu-item"
             onClick={() => navigateView("news")}
           >
             <h3>LPG News Feed</h3>
@@ -2625,6 +2946,127 @@ function App() {
                   </div>
                 )}
               </>
+            )}
+          </article>
+          )}
+
+          {activeView === "reports" && (
+          <article className="table-wrap">
+            <div className="table-header">
+              <div>
+                <h2>Reports Dashboard</h2>
+                <p className="table-sub">
+                  Generate station change reports made by station managers.
+                </p>
+              </div>
+            </div>
+
+            <div className="form-panel">
+              <div className="form-grid">
+                <label>
+                  Search By
+                  <select
+                    value={adminReportSearchBy}
+                    onChange={(event) => setAdminReportSearchBy(event.target.value)}
+                  >
+                    <option value="station">Station</option>
+                    <option value="region">Region</option>
+                  </select>
+                </label>
+                <label>
+                  Search
+                  <input
+                    list="admin-report-search-options"
+                    value={adminReportSearchTerm}
+                    onChange={(event) => setAdminReportSearchTerm(event.target.value)}
+                    placeholder={
+                      adminReportSearchBy === "region"
+                        ? "Type region (e.g. Coimbatore)"
+                        : "Type station name"
+                    }
+                  />
+                </label>
+                <datalist id="admin-report-search-options">
+                  {adminReportSuggestions.map((value) => (
+                    <option key={value} value={value} />
+                  ))}
+                </datalist>
+                <label>
+                  Date Range
+                  <select
+                    value={adminReportPreset}
+                    onChange={(event) => setAdminReportPreset(event.target.value)}
+                  >
+                    <option value="last_week">Last Week</option>
+                    <option value="last_month">Last Month</option>
+                    <option value="custom">Custom Range</option>
+                  </select>
+                </label>
+                {adminReportPreset === "custom" && (
+                  <>
+                    <label>
+                      From
+                      <input
+                        type="date"
+                        value={adminReportFromDate}
+                        onChange={(event) => setAdminReportFromDate(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      To
+                      <input
+                        type="date"
+                        value={adminReportToDate}
+                        onChange={(event) => setAdminReportToDate(event.target.value)}
+                      />
+                    </label>
+                  </>
+                )}
+              </div>
+              <div className="form-actions">
+                <button type="button" onClick={handleGenerateAdminReport} disabled={adminReportLoading}>
+                  {adminReportLoading ? "Generating..." : "Generate Report"}
+                </button>
+              </div>
+            </div>
+
+            {adminReportError && <p className="notice error">{adminReportError}</p>}
+
+            {adminReportGenerated ? (
+              adminReportFlatRows.length ? (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Station</th>
+                      <th>Region</th>
+                      <th>User</th>
+                      <th>Role</th>
+                      <th>Field</th>
+                      <th>Before</th>
+                      <th>After</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {adminReportFlatRows.map((row) => (
+                      <tr key={row.key || row.id}>
+                        <td>{formatDateTime(row.created_at)}</td>
+                        <td>{row.station_name || "-"}</td>
+                        <td>{row.region || "-"}</td>
+                        <td>{row.actor_name || "-"}</td>
+                        <td>{row.actor_role || "-"}</td>
+                        <td>{row.field || "-"}</td>
+                        <td>{formatReportValue(row.before)}</td>
+                        <td>{formatReportValue(row.after)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <p className="table-sub">No change records found for the selected filters.</p>
+              )
+            ) : (
+              <p className="table-sub">Set filters and click Generate Report.</p>
             )}
           </article>
           )}

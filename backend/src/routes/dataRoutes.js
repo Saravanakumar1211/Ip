@@ -13,6 +13,10 @@ import { TentativeCost } from "../models/tentativeCost.js";
 import { UnservedStations } from "../models/unservedStations.js";
 import { AnalyticsDashboard } from "../models/analyticsDashboard.js";
 import { runImport } from "../services/importData.js";
+import {
+  fetchStationChangeReport,
+  recordStationAttributeChange
+} from "../services/stationChangeLogService.js";
 import { authenticate, requireRole } from "../middleware/auth.js";
 
 const router = Router();
@@ -25,6 +29,92 @@ const parseNumber = (value) => {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const roundTo = (value, digits = 2) => {
+  const factor = 10 ** digits;
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+};
+
+const buildSourceComparisonFromCollections = ({ sourceDocs, deliveryPlans }) => {
+  const usage = new Map();
+  for (const plan of deliveryPlans || []) {
+    const sourceId = String(plan?.source_id || "").trim();
+    if (!sourceId) continue;
+    const entry = usage.get(sourceId) || {
+      runs: 0,
+      totalLt: 0,
+      totalCost: 0,
+      totalPurchase: 0
+    };
+    entry.runs += 1;
+    entry.totalLt += Number(plan?.total_load_lt ?? plan?.total_lt ?? 0) || 0;
+    entry.totalCost += Number(plan?.grand_total ?? 0) || 0;
+    entry.totalPurchase += Number(plan?.tot_purchase ?? 0) || 0;
+    usage.set(sourceId, entry);
+  }
+
+  const rows = (sourceDocs || [])
+    .map((item) => ({
+      source_id: String(item?.source_id || "").trim(),
+      source_name: String(item?.source_name || "").trim(),
+      price_per_mt: Number(item?.price_per_mt_ex_terminal ?? 0) || 0
+    }))
+    .filter((item) => item.source_id)
+    .sort((a, b) => a.price_per_mt - b.price_per_mt);
+
+  if (!rows.length) {
+    return [...usage.entries()]
+      .map(([sourceId, row]) => {
+        const totalMt = row.totalLt / MT_TO_LITERS;
+        return {
+          source_id: sourceId,
+          source_name: sourceId,
+          rank: null,
+          price_per_mt: null,
+          vs_cheapest_per_mt: null,
+          recommendation: "",
+          runs: row.runs,
+          total_lt: roundTo(row.totalLt, 0),
+          total_mt: roundTo(totalMt, 3),
+          avg_cost_per_mt: totalMt ? roundTo(row.totalCost / totalMt, 2) : 0,
+          total_purchase: roundTo(row.totalPurchase, 2)
+        };
+      })
+      .sort((a, b) => a.avg_cost_per_mt - b.avg_cost_per_mt);
+  }
+
+  const cheapest = rows[0]?.price_per_mt || 0;
+  return rows.map((row, index) => {
+    const rowUsage = usage.get(row.source_id) || {
+      runs: 0,
+      totalLt: 0,
+      totalCost: 0,
+      totalPurchase: 0
+    };
+    const totalMt = rowUsage.totalLt / MT_TO_LITERS;
+    const vsCheapest = row.price_per_mt - cheapest;
+    const recommendation =
+      index === 0
+        ? "Cheapest terminal - preferred"
+        : index <= 2
+          ? "Competitive option"
+          : `Costlier by Rs ${Math.round(vsCheapest).toLocaleString("en-IN")}/MT`;
+
+    return {
+      source_id: row.source_id,
+      source_name: row.source_name || row.source_id,
+      rank: index + 1,
+      price_per_mt: roundTo(row.price_per_mt, 2),
+      vs_cheapest_per_mt: roundTo(vsCheapest, 2),
+      recommendation,
+      runs: rowUsage.runs,
+      total_lt: roundTo(rowUsage.totalLt, 0),
+      total_mt: roundTo(totalMt, 3),
+      avg_cost_per_mt: totalMt ? roundTo(rowUsage.totalCost / totalMt, 2) : 0,
+      total_purchase: roundTo(rowUsage.totalPurchase, 2)
+    };
+  });
 };
 
 const normalizeStationStock = ({ capacity, deadStock, usable }) => {
@@ -440,19 +530,72 @@ router.patch("/stations/:id", async (req, res) => {
   }
 
   try {
-    const updated = await Station.findByIdAndUpdate(req.params.id, payload, {
-      new: true,
-      runValidators: true
-    });
-    if (!updated) {
+    const existing = await Station.findById(req.params.id);
+    if (!existing) {
       return res.status(404).json({ message: "Station not found." });
     }
-    return res.json(updated);
+
+    const beforeStation = existing.toObject();
+    existing.set(payload);
+    await existing.save();
+
+    await recordStationAttributeChange({
+      beforeStation,
+      afterStation: existing.toObject(),
+      actor: req.user,
+      source: "admin_dashboard"
+    });
+
+    return res.json(existing);
   } catch (error) {
     if (error?.name === "CastError") {
       return res.status(400).json({ message: "Invalid station id." });
     }
     return handleDuplicateError(error, res, "station");
+  }
+});
+
+router.get("/reports/station-changes", async (req, res) => {
+  const searchBy = String(req.query.search_by || "").trim().toLowerCase();
+  const searchTerm = String(req.query.search_term || "").trim();
+  const station = String(
+    req.query.station || (searchBy === "station" ? searchTerm : "")
+  ).trim();
+  const region = String(
+    req.query.region || (searchBy === "region" ? searchTerm : "")
+  ).trim();
+  const actorRoleRaw = String(req.query.actor_role || "station_manager")
+    .trim()
+    .toLowerCase();
+
+  if (!["station_manager", "admin", "all"].includes(actorRoleRaw)) {
+    return res.status(400).json({
+      message: "actor_role must be station_manager, admin, or all."
+    });
+  }
+
+  try {
+    const records = await fetchStationChangeReport({
+      station,
+      region,
+      actorRole: actorRoleRaw === "all" ? null : actorRoleRaw,
+      preset: req.query.preset,
+      from: req.query.from,
+      to: req.query.to,
+      limit: 2000
+    });
+    return res.json({
+      count: records.length,
+      records
+    });
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("date")) {
+      return res.status(400).json({ message: error.message });
+    }
+    return res.status(500).json({
+      message: "Failed to fetch station change report.",
+      error: error.message
+    });
   }
 });
 
@@ -596,7 +739,28 @@ router.get("/analytics/latest", async (_req, res) => {
     if (!latest) {
       return res.status(404).json({ message: "No analytics snapshot found." });
     }
-    return res.json(latest);
+
+    let deliveryDoc = null;
+    if (latest.plan_id) {
+      deliveryDoc = await Delivery.findOne({ plan_id: latest.plan_id }).lean();
+    }
+    if (!deliveryDoc) {
+      deliveryDoc = await Delivery.findOne().sort({ created_at: -1 }).lean();
+    }
+
+    const sourceDocs = await Source.find()
+      .select("source_id source_name price_per_mt_ex_terminal")
+      .lean();
+
+    const sourceComparison = buildSourceComparisonFromCollections({
+      sourceDocs,
+      deliveryPlans: deliveryDoc?.delivery_plans || []
+    });
+
+    return res.json({
+      ...latest,
+      source_comparison: sourceComparison
+    });
   } catch (error) {
     return res.status(500).json({
       message: "Failed to load analytics dashboard.",

@@ -4,6 +4,7 @@ import re
 import sys
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -20,6 +21,39 @@ USE_LIVE_ROUTES = str(os.getenv("USE_LIVE_ROUTES") or "1").strip().lower() in (
     "true",
     "yes",
 )
+
+
+def env_int(name, default, minimum=None):
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if minimum is not None:
+        return max(value, int(minimum))
+    return value
+
+
+def env_float(name, default, minimum=None):
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    if minimum is not None:
+        return max(value, float(minimum))
+    return value
+
+
+ROUTE_MAX_STOPS_PER_TRUCK = env_int(
+    "ROUTE_MAX_STOPS_PER_TRUCK", l3.MAX_STOPS_PER_TRUCK, minimum=2
+)
+ROUTE_MAX_GROUPING_KM = env_float("ROUTE_MAX_GROUPING_KM", l3.MAX_GROUPING_KM, minimum=0.0)
+ROUTE_SPLIT_LOOKBACK_MONTHS = env_int("ROUTE_SPLIT_LOOKBACK_MONTHS", 1, minimum=0)
+ROUTE_SOURCE_ASSIGNMENT_WORKERS = env_int("ROUTE_SOURCE_ASSIGNMENT_WORKERS", 4, minimum=1)
+
+l3.MAX_STOPS_PER_TRUCK = ROUTE_MAX_STOPS_PER_TRUCK
+l3.MAX_GROUPING_KM = ROUTE_MAX_GROUPING_KM
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is required.")
@@ -46,6 +80,70 @@ def to_float(value, default=0.0):
 
 def normalize_name(value):
     return str(value or "").replace("\u2013", "-").replace("\u2014", "-").strip().lower()
+
+
+def month_key_with_lookback(lookback_months):
+    now = datetime.now(timezone.utc)
+    month_index = (now.year * 12 + (now.month - 1)) - int(lookback_months or 0)
+    year = month_index // 12
+    month = month_index % 12 + 1
+    return f"{year:04d}-{month:02d}"
+
+
+def build_split_month_avg_sales(sales_df, daily_df):
+    monthly_ref = pd.DataFrame()
+    if sales_df is not None and not sales_df.empty:
+        monthly_ref = sales_df.copy()
+    elif daily_df is not None and not daily_df.empty:
+        monthly_ref = (
+            daily_df.groupby(["month", "station_name"], as_index=False)
+            .agg(total_sales_lt=("sales_lt", "sum"), days_recorded=("sales_lt", "count"))
+        )
+        monthly_ref["avg_daily_sales_lt"] = monthly_ref.apply(
+            lambda row: (row["total_sales_lt"] / row["days_recorded"]) if row["days_recorded"] else 0.0,
+            axis=1,
+        )
+
+    if monthly_ref.empty:
+        return {}
+
+    monthly_ref["month"] = monthly_ref["month"].astype(str).str.strip()
+    monthly_ref["station_name"] = monthly_ref["station_name"].astype(str).str.strip()
+    monthly_ref["avg_daily_sales_lt"] = pd.to_numeric(
+        monthly_ref.get("avg_daily_sales_lt"), errors="coerce"
+    )
+    monthly_ref["total_sales_lt"] = pd.to_numeric(
+        monthly_ref.get("total_sales_lt"), errors="coerce"
+    ).fillna(0.0)
+    monthly_ref["days_recorded"] = pd.to_numeric(
+        monthly_ref.get("days_recorded"), errors="coerce"
+    ).fillna(0.0)
+    fallback_avg = monthly_ref["total_sales_lt"] / monthly_ref["days_recorded"].replace(0, pd.NA)
+    monthly_ref["resolved_avg"] = monthly_ref["avg_daily_sales_lt"].where(
+        monthly_ref["avg_daily_sales_lt"] > 0, fallback_avg
+    ).fillna(0.0)
+
+    available_months = sorted(
+        [value for value in monthly_ref["month"].dropna().unique().tolist() if value]
+    )
+    if not available_months:
+        return {}
+
+    preferred_month = month_key_with_lookback(ROUTE_SPLIT_LOOKBACK_MONTHS)
+    target_month = preferred_month if preferred_month in available_months else available_months[-1]
+
+    selected = monthly_ref[monthly_ref["month"] == target_month]
+    if selected.empty:
+        return {}
+
+    avg_sales = {}
+    for station_name, group in selected.groupby("station_name"):
+        avg_val = pd.to_numeric(group["resolved_avg"], errors="coerce").mean()
+        if pd.isna(avg_val) or avg_val <= 0:
+            continue
+        avg_sales[str(station_name).strip()] = float(avg_val)
+
+    return avg_sales
 
 
 def parse_capacity_mt(value):
@@ -160,10 +258,10 @@ def load_sales_context(db):
         )
         sales_df = monthly_agg
 
-    avg_sales = {}
+    avg_sales_overall = {}
     if not daily_df.empty:
         for station_name, group in daily_df.groupby("station_name"):
-            avg_sales[station_name] = float(group["sales_lt"].mean())
+            avg_sales_overall[station_name] = float(group["sales_lt"].mean())
     else:
         for station_name, group in sales_df.groupby("station_name"):
             avg_val = pd.to_numeric(group.get("avg_daily_sales_lt"), errors="coerce").mean()
@@ -171,7 +269,12 @@ def load_sales_context(db):
                 monthly = pd.to_numeric(group.get("total_sales_lt"), errors="coerce").mean()
                 days = pd.to_numeric(group.get("days_recorded"), errors="coerce").mean()
                 avg_val = (monthly / days) if days and not pd.isna(days) else 1000.0
-            avg_sales[station_name] = float(avg_val)
+            avg_sales_overall[station_name] = float(avg_val)
+
+    # Split weighting prioritizes the configured lookback month (default: previous month)
+    # while retaining overall averages as fallback for stations with missing month data.
+    split_month_avg = build_split_month_avg_sales(sales_df, daily_df)
+    avg_sales = {**avg_sales_overall, **split_month_avg}
 
     if not daily_df.empty:
         wide = daily_df.pivot_table(
@@ -309,12 +412,14 @@ def load_from_db(db):
         else:
             parked_label = station_name or source_name or "Travelling"
 
+        capacity_lt = get_truck_capacity_lt(truck)
+
         trucks.append(
             {
                 "truck_id": truck_id,
                 "type": str(truck.get("type") or "").strip() or "7MT",
-                "capacity_lt": get_truck_capacity_lt(truck),
-                "capacity_mt": round(get_truck_capacity_lt(truck) / l3.MT_TO_LITERS, 3),
+                "capacity_lt": capacity_lt,
+                "capacity_mt": round(capacity_lt / l3.MT_TO_LITERS, 3),
                 "state": state,
                 "parked_station": station_name or None,
                 "parked_source": source_name or None,
@@ -394,11 +499,13 @@ def allocate_delivery_quantities(stops, truck_capacity_lt, avg_sales):
 
 
 def assign_cheapest_source(stations, sources):
-    station_data = []
-    for station in stations:
+    if not stations or not sources:
+        return []
+
+    def evaluate_station(index, station):
         needed_mt = station["needed_lt"] / l3.MT_TO_LITERS if station["needed_lt"] else 0.0
         if needed_mt <= 0:
-            continue
+            return index, None
 
         best = None
         best_total = float("inf")
@@ -414,27 +521,42 @@ def assign_cheapest_source(stations, sources):
                 best = (src, dist_km, toll)
 
         if not best:
-            continue
+            return index, None
 
         src, src_dist, src_toll = best
-        station_data.append(
-            {
-                "station": station["station"],
-                "station_lat": station["station_lat"],
-                "station_lon": station["station_lon"],
-                "needed_lt": station["needed_lt"],
-                "needed_mt": round(station["needed_lt"] / l3.MT_TO_LITERS, 3),
-                "source_id": src["source_id"],
-                "source_name": src["source_name"],
-                "source_lat": src["source_lat"],
-                "source_lon": src["source_lon"],
-                "price_mt": src["price_mt"],
-                "source_station_dist_km": src_dist,
-                "source_station_toll": src_toll,
-            }
-        )
+        return index, {
+            "station": station["station"],
+            "station_lat": station["station_lat"],
+            "station_lon": station["station_lon"],
+            "needed_lt": station["needed_lt"],
+            "needed_mt": round(station["needed_lt"] / l3.MT_TO_LITERS, 3),
+            "source_id": src["source_id"],
+            "source_name": src["source_name"],
+            "source_lat": src["source_lat"],
+            "source_lon": src["source_lon"],
+            "price_mt": src["price_mt"],
+            "source_station_dist_km": src_dist,
+            "source_station_toll": src_toll,
+        }
 
-    return station_data
+    workers = min(ROUTE_SOURCE_ASSIGNMENT_WORKERS, len(stations))
+    if workers <= 1:
+        out = []
+        for idx, station in enumerate(stations):
+            _, row = evaluate_station(idx, station)
+            if row:
+                out.append(row)
+        return out
+
+    indexed = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(evaluate_station, idx, station) for idx, station in enumerate(stations)]
+        for future in as_completed(futures):
+            idx, row = future.result()
+            if row:
+                indexed[idx] = row
+
+    return [indexed[idx] for idx in sorted(indexed.keys())]
 
 
 def build_plan(stations, sources, trucks, avg_sales):
@@ -507,20 +629,30 @@ def build_plan(stations, sources, trucks, avg_sales):
                 continue
 
             total_need_lt = sum(stop["needed_lt"] for stop in run)
-            fitting = sorted(
-                [(d, t) for d, t in candidates_all if t["capacity_lt"] >= total_need_lt],
-                key=lambda item: item[0],
-            )
-            if fitting:
-                _, chosen = fitting[0]
+            nearest_fitting = None
+            largest_capacity = None
+            for distance_to_source, truck in candidates_all:
+                capacity_lt = float(truck.get("capacity_lt") or 0.0)
+                if capacity_lt >= total_need_lt:
+                    if nearest_fitting is None or distance_to_source < nearest_fitting[0]:
+                        nearest_fitting = (distance_to_source, truck)
+                if largest_capacity is None:
+                    largest_capacity = (capacity_lt, distance_to_source, truck)
+                elif (
+                    capacity_lt > largest_capacity[0]
+                    or (
+                        capacity_lt == largest_capacity[0]
+                        and distance_to_source < largest_capacity[1]
+                    )
+                ):
+                    largest_capacity = (capacity_lt, distance_to_source, truck)
+
+            if nearest_fitting:
+                _, chosen = nearest_fitting
             else:
                 # If no truck can fully satisfy combined demand, prefer the largest
                 # available capacity first (maximise delivered litres), then nearest.
-                best = sorted(
-                    candidates_all,
-                    key=lambda item: (-float(item[1].get("capacity_lt") or 0.0), item[0]),
-                )
-                _, chosen = best[0]
+                _, _, chosen = largest_capacity
             truck_available[chosen["truck_id"]] = False
 
             split_used = allocate_delivery_quantities(run, chosen["capacity_lt"], avg_sales)
@@ -960,9 +1092,12 @@ def write_plan(db, delivery_plans, fleet_status, trucks, unserved, stations_df, 
             "meta": {
                 "rules": {
                     "max_stops_per_truck": int(l3.MAX_STOPS_PER_TRUCK),
+                    "max_grouping_km": float(l3.MAX_GROUPING_KM),
                     "no_refueling": True,
                     "return_to_same_source": True,
                     "alternating_split": True,
+                    "split_sales_lookback_months": int(ROUTE_SPLIT_LOOKBACK_MONTHS),
+                    "source_assignment_workers": int(ROUTE_SOURCE_ASSIGNMENT_WORKERS),
                     "source": "pythonLogic/logic3.py",
                 }
             },

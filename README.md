@@ -59,9 +59,19 @@ JWT_SECRET="change-this-secret"
 ADMIN_EMAIL="admin@krfuels.com"
 ADMIN_PASSWORD="Admin@123"
 ADMIN_NAME="Admin"
+ROUTE_MAX_STOPS_PER_TRUCK=2
+ROUTE_MAX_GROUPING_KM=80
+ROUTE_SPLIT_LOOKBACK_MONTHS=1
+ROUTE_SOURCE_ASSIGNMENT_WORKERS=4
 ```
 
 `DB_NAME` and `PORT` are optional.
+
+Routing env knobs:
+- `ROUTE_MAX_STOPS_PER_TRUCK`: max stations per truck run (default `2`).
+- `ROUTE_MAX_GROUPING_KM`: grouping radius used when clustering stops (default `80`).
+- `ROUTE_SPLIT_LOOKBACK_MONTHS`: sales split lookback window in months (`1` = previous month).
+- `ROUTE_SOURCE_ASSIGNMENT_WORKERS`: parallel workers for source-cost assignment (default `4`).
 
 ## Setup
 
