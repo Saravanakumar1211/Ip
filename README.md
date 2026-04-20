@@ -47,26 +47,6 @@ Derived from `pythonLogic/truck_positions.json`:
 - npm
 - MongoDB Atlas/local MongoDB URI in `.env`
 
-## Environment
-
-Root `.env` is already used:
-
-```env
-MONGO_URI="your-mongodb-connection-string"
-DB_NAME="operations_optimization"
-PORT=5000
-JWT_SECRET="change-this-secret"
-ADMIN_EMAIL="admin@krfuels.com"
-ADMIN_PASSWORD="Admin@123"
-ADMIN_NAME="Admin"
-ROUTE_MAX_STOPS_PER_TRUCK=2
-ROUTE_MAX_GROUPING_KM=80
-ROUTE_SPLIT_LOOKBACK_MONTHS=1
-ROUTE_SOURCE_ASSIGNMENT_WORKERS=4
-```
-
-`DB_NAME` and `PORT` are optional.
-
 Routing env knobs:
 - `ROUTE_MAX_STOPS_PER_TRUCK`: max stations per truck run (default `2`).
 - `ROUTE_MAX_GROUPING_KM`: grouping radius used when clustering stops (default `80`).
